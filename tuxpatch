@@ -1,0 +1,975 @@
+#!/usr/bin/env python3
+"""
+tuxpatch - RHEL workstation patch manager with TPM2/LUKS reseal support
+"""
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    sys.exit("Error: PyYAML is required. Install with: dnf install python3-pyyaml")
+
+VERSION = "1.0.0"
+
+CONFIG_PATH = "/etc/tuxpatch/config"
+STATE_DIR = "/var/lib/tuxpatch"
+RESEAL_PENDING_FILE = f"{STATE_DIR}/reseal.pending"
+RESEAL_SERVICE_NAME = "tuxpatch-reseal.service"
+RESEAL_SERVICE_PATH = f"/etc/systemd/system/{RESEAL_SERVICE_NAME}"
+TEMP_BLS_ENTRY = "/boot/loader/entries/tuxpatch-reseal.conf"
+
+# Package prefixes that trigger a reseal when updated
+RESEAL_TRIGGERS = (
+    "kernel",
+    "kernel-core",
+    "kernel-modules",
+    "shim",
+    "shim-x64",
+    "grub2",
+    "grub2-efi",
+    "grub2-efi-x64",
+)
+
+DEFAULTS = {
+    "connectivity": {
+        "method": "ping",
+        "server": "8.8.8.8",
+        "port": 443,
+        "timeout": 5,
+    },
+    "users": {
+        "uid_range": [1000, 2000],
+        "sssd_groups": [],
+    },
+    "flatpak": {
+        "flat_manager_checkin": True,
+    },
+    "tpm_reseal": {
+        "enabled": True,
+        "luks_password_file": "/etc/tuxpatch/luks.key",
+        "pcr_ids": [7],
+    },
+}
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+
+def load_config() -> dict:
+    config_path = Path(CONFIG_PATH)
+    if not config_path.exists():
+        print(
+            f"Warning: {CONFIG_PATH} not found, using defaults.", file=sys.stderr
+        )
+        return _deep_copy(DEFAULTS)
+
+    with open(config_path) as f:
+        user_config = yaml.safe_load(f) or {}
+
+    config = _deep_copy(DEFAULTS)
+    for section, values in user_config.items():
+        if isinstance(values, dict) and section in config and isinstance(config[section], dict):
+            config[section] = {**config[section], **values}
+        else:
+            config[section] = values
+    return config
+
+
+def _deep_copy(d):
+    """Simple deep copy for dicts/lists of primitives."""
+    if isinstance(d, dict):
+        return {k: _deep_copy(v) for k, v in d.items()}
+    if isinstance(d, list):
+        return list(d)
+    return d
+
+
+# ── Connectivity ──────────────────────────────────────────────────────────────
+
+
+def check_connectivity(config: dict) -> bool:
+    method = config["connectivity"]["method"]
+    server = config["connectivity"]["server"]
+    timeout = int(config["connectivity"].get("timeout", 5))
+    port = int(config["connectivity"].get("port", 443))
+
+    try:
+        if method == "ping":
+            r = subprocess.run(
+                ["ping", "-c", "1", "-W", str(timeout), server],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return r.returncode == 0
+
+        elif method == "tcp":
+            conn = socket.create_connection((server, port), timeout=timeout)
+            conn.close()
+            return True
+
+        elif method == "http":
+            url = server if server.startswith("http") else f"http://{server}"
+            req = urllib.request.Request(url, method="HEAD")
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return resp.status < 500
+            except urllib.error.HTTPError as e:
+                return e.code < 500
+
+        else:
+            print(f"Unknown connectivity method: {method!r}", file=sys.stderr)
+            return False
+
+    except Exception:
+        return False
+
+
+# ── Users ─────────────────────────────────────────────────────────────────────
+
+
+def _get_sssd_group_members(groups: list) -> set:
+    """Return set of usernames that belong to any of the given AD/LDAP groups."""
+    members: set = set()
+    for group in groups:
+        r = subprocess.run(
+            ["getent", "group", group],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            # groupname:password:gid:member1,member2,...
+            parts = r.stdout.strip().split(":")
+            if len(parts) >= 4 and parts[3]:
+                members.update(parts[3].split(","))
+    return members
+
+
+def get_users_to_update(config: dict) -> dict:
+    """Return {username: home_dir} for every user that should get flatpak updates."""
+    uid_min, uid_max = config["users"]["uid_range"]
+    sssd_groups = config["users"].get("sssd_groups", [])
+    sssd_members = _get_sssd_group_members(sssd_groups) if sssd_groups else set()
+
+    no_login_shells = {"/sbin/nologin", "/bin/false", "/usr/sbin/nologin"}
+
+    r = subprocess.run(
+        ["getent", "passwd"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+
+    users: dict = {}
+    for line in r.stdout.splitlines():
+        parts = line.split(":")
+        if len(parts) < 7:
+            continue
+        username, _, uid_str, _, _, home, shell = parts[:7]
+        try:
+            uid = int(uid_str)
+        except ValueError:
+            continue
+
+        in_range = uid_min <= uid <= uid_max
+        in_group = username in sssd_members
+
+        if (in_range or in_group) and home and Path(home).exists():
+            if shell not in no_login_shells:
+                users[username] = home
+
+    return users
+
+
+# ── Flatpak ───────────────────────────────────────────────────────────────────
+
+
+def _flatpak_available() -> bool:
+    return bool(subprocess.run(
+        ["which", "flatpak"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0)
+
+
+def get_system_flatpak_updates() -> list:
+    r = subprocess.run(
+        ["flatpak", "--system", "remote-ls", "--updates", "--columns=application"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def get_user_flatpak_updates(username: str) -> list:
+    r = subprocess.run(
+        [
+            "runuser", "-l", username, "-c",
+            "flatpak --user remote-ls --updates --columns=application 2>/dev/null",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def update_user_flatpaks(username: str) -> bool:
+    r = subprocess.run(
+        [
+            "runuser", "-l", username, "-c",
+            "flatpak --user update -y --noninteractive 2>&1",
+        ],
+        text=True,
+    )
+    return r.returncode == 0
+
+
+def update_system_flatpaks() -> bool:
+    r = subprocess.run(
+        ["flatpak", "--system", "update", "-y", "--noninteractive"],
+        text=True,
+    )
+    return r.returncode == 0
+
+
+def run_flat_manager_checkin():
+    checkin = Path("/usr/bin/flat-manager-checkin")
+    if checkin.exists():
+        print("Running /usr/bin/flat-manager-checkin...")
+        subprocess.run([str(checkin)], check=False)
+
+
+# ── RPM / DNF ─────────────────────────────────────────────────────────────────
+
+
+def get_rpm_updates() -> list:
+    """Return list of package names (with arch) that have pending updates."""
+    r = subprocess.run(
+        ["dnf", "check-update", "--quiet"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    # exit 100 = updates available, 0 = none, other = error
+    packages = []
+    in_obsoleting = False
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("Obsoleting"):
+            in_obsoleting = True
+            continue
+        if line.startswith("Last metadata") or line.startswith("Security:"):
+            continue
+        if in_obsoleting:
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            packages.append(parts[0])
+    return packages
+
+
+def _pkg_base(pkg_name: str) -> str:
+    """Strip epoch, version, release, arch from a package name."""
+    # names from 'dnf check-update' look like: kernel.x86_64 or kernel-core.x86_64
+    return pkg_name.split(".")[0]
+
+
+def kernel_or_shim_will_update(rpm_updates: list) -> bool:
+    for pkg in rpm_updates:
+        base = _pkg_base(pkg)
+        for trigger in RESEAL_TRIGGERS:
+            if base == trigger or base.startswith(trigger + "-"):
+                return True
+    return False
+
+
+def update_system() -> bool:
+    r = subprocess.run(["dnf", "upgrade", "-y", "--refresh"], text=True)
+    return r.returncode == 0
+
+
+def get_default_kernel_version() -> str | None:
+    """Return the kernel version string that grubby would boot by default."""
+    r = subprocess.run(
+        ["grubby", "--default-kernel"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    # /boot/vmlinuz-6.1.5-200.el9.x86_64  →  6.1.5-200.el9.x86_64
+    kernel_path = r.stdout.strip()
+    name = Path(kernel_path).name
+    if name.startswith("vmlinuz-"):
+        return name[len("vmlinuz-"):]
+    return None
+
+
+# ── LUKS / Clevis / TPM2 ─────────────────────────────────────────────────────
+
+
+def get_luks_devices_from_crypttab() -> list:
+    """Return list of (mapper_name, resolved_device_path) from /etc/crypttab."""
+    crypttab = Path("/etc/crypttab")
+    devices = []
+    if not crypttab.exists():
+        return devices
+    with open(crypttab) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            name, device = parts[0], parts[1]
+            if device.startswith("UUID="):
+                device = f"/dev/disk/by-uuid/{device[5:]}"
+            devices.append((name, device))
+    return devices
+
+
+def get_clevis_slots(device: str) -> list:
+    """Return clevis-managed LUKS slot numbers for a device."""
+    r = subprocess.run(
+        ["clevis", "luks", "list", "-d", device],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    slots = []
+    for line in r.stdout.splitlines():
+        # Output: "1: tpm2 '{"pcr_ids":"7"}'"
+        parts = line.strip().split(":")
+        if parts:
+            try:
+                slots.append(int(parts[0].strip()))
+            except ValueError:
+                pass
+    return slots
+
+
+def _pcr_ids_str(config: dict) -> str:
+    return ",".join(str(p) for p in config["tpm_reseal"].get("pcr_ids", [7]))
+
+
+def _temp_initrd_path(kernel_version: str) -> str:
+    return f"/boot/initramfs-{kernel_version}-tuxpatch-reseal.img"
+
+
+def _check_key_file(path: str):
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"LUKS key file not found: {path}")
+    stat = p.stat()
+    if stat.st_mode & 0o077:
+        print(
+            f"Warning: {path} has loose permissions. Recommend: chmod 600 {path}",
+            file=sys.stderr,
+        )
+    if stat.st_uid != 0:
+        print(f"Warning: {path} is not owned by root.", file=sys.stderr)
+
+
+def build_temp_initrd(config: dict, kernel_version: str) -> str:
+    """
+    Build a temporary initrd that embeds the LUKS key and omits clevis.
+    Returns the path to the created initrd image.
+    The key is included so dracut's crypt module can use rd.luks.key to
+    unlock LUKS without relying on clevis/TPM (which would fail after a
+    shim/kernel update changes PCR values).
+    """
+    luks_key = config["tpm_reseal"]["luks_password_file"]
+    _check_key_file(luks_key)
+
+    temp_initrd = _temp_initrd_path(kernel_version)
+    print(f"Building temporary initrd: {temp_initrd}")
+
+    cmd = [
+        "dracut",
+        "--force",
+        "--omit", "clevis",
+        "--include", luks_key, "/etc/tuxpatch-luks.key",
+        temp_initrd,
+        kernel_version,
+    ]
+    r = subprocess.run(cmd, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"dracut failed (exit {r.returncode})")
+
+    # Restrict permissions — the initrd contains the embedded key
+    Path(temp_initrd).chmod(0o600)
+    return temp_initrd
+
+
+def _get_kernel_cmdline(kernel_version: str) -> str:
+    """Get kernel cmdline from the existing BLS/grubby entry."""
+    entries_dir = Path("/boot/loader/entries")
+    if entries_dir.exists():
+        for entry in sorted(entries_dir.glob("*.conf")):
+            text = entry.read_text()
+            has_kernel = any(
+                kernel_version in ln
+                for ln in text.splitlines()
+                if ln.startswith("linux ")
+            )
+            if has_kernel:
+                for ln in text.splitlines():
+                    if ln.startswith("options "):
+                        return ln[len("options "):].strip()
+
+    # Fallback: grubby
+    r = subprocess.run(
+        ["grubby", "--info", f"/boot/vmlinuz-{kernel_version}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    for ln in r.stdout.splitlines():
+        if ln.startswith("args="):
+            return ln[5:].strip('"').strip("'")
+    return "ro"
+
+
+def create_temp_bls_entry(kernel_version: str, temp_initrd_path: str):
+    """Create a temporary BLS boot entry that boots using the key-embedded initrd."""
+    options = _get_kernel_cmdline(kernel_version)
+
+    # Strip any existing clevis/luks.key options to avoid conflicts
+    clean_opts = [
+        o for o in options.split()
+        if not o.startswith("rd.clevis")
+        and not o.startswith("rd.luks.clevis")
+        and not o.startswith("rd.luks.key")
+    ]
+    clean_opts.append("rd.luks.key=/etc/tuxpatch-luks.key")
+    final_options = " ".join(clean_opts)
+
+    machine_id = Path("/etc/machine-id").read_text().strip()
+    initrd_name = Path(temp_initrd_path).name
+
+    content = (
+        f"title TuxPatch Reseal ({kernel_version})\n"
+        f"version tuxpatch-reseal\n"
+        f"machine-id {machine_id}\n"
+        f"linux /vmlinuz-{kernel_version}\n"
+        f"initrd /{initrd_name}\n"
+        f"options {final_options}\n"
+    )
+
+    bls_path = Path(TEMP_BLS_ENTRY)
+    bls_path.parent.mkdir(parents=True, exist_ok=True)
+    bls_path.write_text(content)
+    bls_path.chmod(0o644)
+    print(f"Created temporary boot entry: {TEMP_BLS_ENTRY}")
+
+
+def _set_grub_default(entry_title: str):
+    r = subprocess.run(
+        ["grub2-set-default", entry_title],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"grub2-set-default failed: {r.stderr.strip()}"
+        )
+
+
+def _get_normal_bls_title(kernel_version: str) -> str | None:
+    """Return the BLS title for the normal (non-reseal) entry for this kernel."""
+    entries_dir = Path("/boot/loader/entries")
+    if not entries_dir.exists():
+        return None
+    for entry in sorted(entries_dir.glob("*.conf")):
+        if entry == Path(TEMP_BLS_ENTRY):
+            continue
+        text = entry.read_text()
+        has_kernel = any(
+            kernel_version in ln
+            for ln in text.splitlines()
+            if ln.startswith("linux ")
+        )
+        if has_kernel:
+            for ln in text.splitlines():
+                if ln.startswith("title "):
+                    return ln[len("title "):].strip()
+    return None
+
+
+def install_reseal_service(config: dict, kernel_version: str, normal_entry_title: str):
+    """Install the one-shot systemd service that reseals clevis on the reseal boot."""
+    pcr_ids = _pcr_ids_str(config)
+    luks_key = config["tpm_reseal"]["luks_password_file"]
+    tuxpatch_bin = Path(sys.argv[0]).resolve()
+
+    service_content = f"""\
+[Unit]
+Description=TuxPatch TPM2 Reseal After Kernel/Shim Update
+After=local-fs.target sysinit.target
+Before=network.target graphical.target
+ConditionPathExists={RESEAL_PENDING_FILE}
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart={tuxpatch_bin} --do-reseal
+# Connect to tty1 so notifications are visible on the physical console
+# and the failure prompt can accept keyboard input.
+TTYPath=/dev/tty1
+StandardInput=tty
+StandardOutput=journal+console
+StandardError=journal+console
+TTYReset=no
+TTYVHangup=no
+TimeoutStartSec=300
+
+[Install]
+WantedBy=sysinit.target
+"""
+
+    Path(RESEAL_SERVICE_PATH).write_text(service_content)
+
+    Path(STATE_DIR).mkdir(parents=True, exist_ok=True)
+    state = {
+        "kernel_version": kernel_version,
+        "pcr_ids": pcr_ids,
+        "luks_password_file": luks_key,
+        "normal_entry_title": normal_entry_title or "",
+    }
+    with open(RESEAL_PENDING_FILE, "w") as f:
+        for k, v in state.items():
+            f.write(f"{k}={v}\n")
+    Path(RESEAL_PENDING_FILE).chmod(0o600)
+
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "enable", RESEAL_SERVICE_NAME], check=True)
+    print(f"Installed and enabled {RESEAL_SERVICE_NAME}")
+
+
+# ── Boot-time UI helpers ─────────────────────────────────────────────────────
+# These are used only during the reseal boot, where the service runs on tty1
+# before the graphical session starts.
+
+_BOLD   = "\033[1m"
+_RED    = "\033[1;31m"
+_GREEN  = "\033[1;32m"
+_YELLOW = "\033[1;33m"
+_CYAN   = "\033[1;36m"
+_RESET  = "\033[0m"
+
+
+def _plymouth_active() -> bool:
+    r = subprocess.run(
+        ["plymouth", "--ping"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return r.returncode == 0
+
+
+def _plymouth_message(text: str):
+    subprocess.run(
+        ["plymouth", "message", "--text", text],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _write_tty(text: str):
+    """Write directly to /dev/tty1, ignoring errors (tty may not exist)."""
+    try:
+        with open("/dev/tty1", "w") as tty:
+            tty.write(text)
+            tty.flush()
+    except Exception:
+        pass
+
+
+def _boot_notify(message: str):
+    """
+    Show a status message during the reseal boot.
+    Writes to: journal (print), Plymouth splash, and /dev/tty1.
+    """
+    print(message)
+    tag = f"[TuxPatch] {message}"
+    if _plymouth_active():
+        _plymouth_message(tag)
+    _write_tty(f"\n{_CYAN}{_BOLD}[TuxPatch]{_RESET} {message}\n")
+
+
+def _boot_error_wait(message: str):
+    """
+    Show an error during the reseal boot, hide Plymouth so the user can
+    see the TTY, wait for Enter, then reboot.
+    """
+    print(f"ERROR: {message}", file=sys.stderr)
+
+    # Hide Plymouth splash so the text console is visible
+    if _plymouth_active():
+        _plymouth_message(f"[TuxPatch] ERROR: {message}")
+        subprocess.run(
+            ["plymouth", "hide-splash"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    _write_tty(
+        f"\n{_RED}{_BOLD}╔══ TuxPatch Reseal FAILED ══════════════════════════════╗{_RESET}\n"
+        f"{_RED}{_BOLD}║{_RESET} {message:<54}{_RED}{_BOLD}║{_RESET}\n"
+        f"{_RED}{_BOLD}╚════════════════════════════════════════════════════════╝{_RESET}\n"
+        f"\n{_YELLOW}The temporary initrd and boot entry have been kept.\n"
+        f"The system will try again on the next boot.{_RESET}\n"
+        f"\n{_BOLD}Press Enter to reboot and try again...{_RESET} ",
+    )
+
+    # stdin is /dev/tty1 when the service runs with StandardInput=tty
+    try:
+        sys.stdin.readline()
+    except Exception:
+        import time
+        time.sleep(30)
+
+    subprocess.run(["systemctl", "reboot"])
+
+
+def _read_state_file() -> dict:
+    state = {}
+    with open(RESEAL_PENDING_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if "=" in line:
+                k, v = line.split("=", 1)
+                state[k.strip()] = v.strip()
+    return state
+
+
+def do_reseal():
+    """
+    Internal command invoked by the reseal systemd service on first boot
+    after a kernel/shim update. Performs:
+      1. Unbind + rebind all clevis slots with current PCR values
+      2. Rebuild the normal initrd
+      3. Clean up temp initrd, BLS entry, service, state file
+      4. Restore grub default to normal entry
+      5. Reboot
+    """
+    if not Path(RESEAL_PENDING_FILE).exists():
+        print("No reseal pending.", file=sys.stderr)
+        return
+
+    state = _read_state_file()
+    kernel_version = state.get("kernel_version", "")
+    pcr_ids = state.get("pcr_ids", "7")
+    luks_key = state.get("luks_password_file", "")
+    normal_entry_title = state.get("normal_entry_title", "")
+
+    if not kernel_version:
+        _boot_error_wait("kernel_version missing from state file.")
+        sys.exit(1)
+
+    if not luks_key or not Path(luks_key).exists():
+        _boot_error_wait(f"LUKS key file not found: {luks_key}")
+        sys.exit(1)
+
+    _boot_notify(f"=== TPM2 Reseal started (kernel {kernel_version}) ===")
+
+    # ── 1. Rebind clevis on all LUKS devices ──────────────────────────────────
+    tpm_config = json.dumps({"pcr_ids": pcr_ids})
+    devices = get_luks_devices_from_crypttab()
+    reseal_failed = False
+    failed_device = ""
+
+    for mapper_name, device in devices:
+        # Resolve symlink (e.g. /dev/disk/by-uuid/...)
+        try:
+            real_device = str(Path(device).resolve())
+        except Exception:
+            real_device = device
+
+        slots = get_clevis_slots(real_device)
+        if not slots:
+            _boot_notify(f"{real_device} ({mapper_name}): no clevis binding, skipping.")
+            continue
+
+        _boot_notify(f"Resealing {real_device} (slots: {slots}) with PCR [{pcr_ids}]...")
+
+        # Unbind all existing clevis slots
+        for slot in slots:
+            subprocess.run(
+                ["clevis", "luks", "unbind", "-d", real_device, "-s", str(slot), "-f"],
+                check=False,
+            )
+
+        # Rebind using the LUKS key to authorise the new binding
+        r = subprocess.run(
+            [
+                "clevis", "luks", "bind",
+                "-d", real_device,
+                "-k", luks_key,
+                "tpm2", tpm_config,
+            ],
+            text=True,
+        )
+        if r.returncode != 0:
+            reseal_failed = True
+            failed_device = real_device
+
+    if reseal_failed:
+        # Leave temp initrd and BLS entry in place so the next boot also uses
+        # the key-embedded initrd and the service retries.
+        _boot_error_wait(f"clevis bind failed for {failed_device}")
+        sys.exit(1)
+
+    _boot_notify("All devices resealed successfully.")
+
+    # ── 2. Rebuild the normal initrd ──────────────────────────────────────────
+    normal_initrd = f"/boot/initramfs-{kernel_version}.img"
+    _boot_notify(f"Rebuilding normal initrd: {normal_initrd}")
+    r = subprocess.run(
+        ["dracut", "--force", normal_initrd, kernel_version],
+        text=True,
+    )
+    if r.returncode != 0:
+        print(
+            "Warning: dracut failed to rebuild normal initrd. "
+            "You may need to run it manually.",
+            file=sys.stderr,
+        )
+
+    # ── 3. Cleanup ────────────────────────────────────────────────────────────
+    temp_initrd = _temp_initrd_path(kernel_version)
+    if Path(temp_initrd).exists():
+        Path(temp_initrd).unlink()
+        _boot_notify(f"Removed temporary initrd: {temp_initrd}")
+
+    if Path(TEMP_BLS_ENTRY).exists():
+        Path(TEMP_BLS_ENTRY).unlink()
+        _boot_notify(f"Removed temporary BLS entry: {TEMP_BLS_ENTRY}")
+
+    subprocess.run(["systemctl", "disable", RESEAL_SERVICE_NAME], check=False)
+    if Path(RESEAL_SERVICE_PATH).exists():
+        Path(RESEAL_SERVICE_PATH).unlink()
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+
+    Path(RESEAL_PENDING_FILE).unlink(missing_ok=True)
+
+    # ── 4. Restore grub default ───────────────────────────────────────────────
+    if normal_entry_title:
+        try:
+            _set_grub_default(normal_entry_title)
+            _boot_notify(f"Restored grub default to: {normal_entry_title!r}")
+        except RuntimeError as e:
+            print(f"Warning: could not restore grub default: {e}", file=sys.stderr)
+    else:
+        # Fall back: set default to the new kernel by path
+        subprocess.run(
+            ["grubby", "--set-default", f"/boot/vmlinuz-{kernel_version}"],
+            check=False,
+        )
+
+    _boot_notify("Reseal complete. Rebooting...")
+    subprocess.run(["systemctl", "reboot"])
+
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+
+def cmd_update(config: dict):
+    # ── 1. Connectivity ───────────────────────────────────────────────────────
+    print("Checking connectivity...")
+    if not check_connectivity(config):
+        print("Not connected")
+        return
+
+    # ── 2. Pre-update: check which packages would be updated ─────────────────
+    print("Checking pending updates...")
+    rpm_updates = get_rpm_updates()
+    needs_reseal = (
+        config["tpm_reseal"]["enabled"]
+        and kernel_or_shim_will_update(rpm_updates)
+    )
+
+    # ── 3. Update per-user flatpaks ───────────────────────────────────────────
+    if _flatpak_available():
+        users = get_users_to_update(config)
+        if users:
+            print(f"Updating user flatpaks for {len(users)} user(s)...")
+            for username, _ in users.items():
+                print(f"  [{username}] flatpak --user update")
+                update_user_flatpaks(username)
+        else:
+            print("No applicable users found for flatpak updates.")
+
+        # ── 4. Update system flatpaks ─────────────────────────────────────────
+        print("Updating system flatpaks...")
+        update_system_flatpaks()
+
+        # ── 5. flat-manager-checkin ───────────────────────────────────────────
+        if config["flatpak"].get("flat_manager_checkin", True):
+            run_flat_manager_checkin()
+    else:
+        print("flatpak not found, skipping flatpak updates.")
+
+    # ── 6. Update system packages ─────────────────────────────────────────────
+    print("Updating system packages (dnf upgrade)...")
+    if not update_system():
+        print("Warning: dnf upgrade reported a non-zero exit code.", file=sys.stderr)
+
+    # ── 7. TPM reseal setup (if needed) ──────────────────────────────────────
+    if needs_reseal:
+        print("\nKernel or shim will be updated — preparing TPM2 reseal.")
+        kernel_version = get_default_kernel_version()
+        if not kernel_version:
+            print(
+                "Warning: could not determine new kernel version from grubby. "
+                "TPM reseal will not be configured.",
+                file=sys.stderr,
+            )
+            return
+
+        print(f"New default kernel: {kernel_version}")
+
+        # Build temporary initrd embedding the LUKS key
+        try:
+            temp_initrd = build_temp_initrd(config, kernel_version)
+        except (FileNotFoundError, RuntimeError) as e:
+            print(f"Error building temp initrd: {e}", file=sys.stderr)
+            return
+
+        # Record normal BLS title before we change the default
+        normal_title = _get_normal_bls_title(kernel_version)
+
+        # Create temporary BLS boot entry
+        create_temp_bls_entry(kernel_version, temp_initrd)
+
+        # Set the reseal entry as the persistent grub default so that
+        # repeated reboots keep retrying until reseal succeeds
+        try:
+            _set_grub_default(f"TuxPatch Reseal ({kernel_version})")
+        except RuntimeError as e:
+            print(f"Warning: {e}", file=sys.stderr)
+
+        # Install the one-shot reseal service
+        install_reseal_service(config, kernel_version, normal_title or "")
+
+        print("Rebooting to perform TPM reseal...")
+        subprocess.run(["systemctl", "reboot"])
+    else:
+        print("\nUpdate complete.")
+
+
+def cmd_status(config: dict):
+    # ── Connectivity ──────────────────────────────────────────────────────────
+    connected = check_connectivity(config)
+    print(f"Connectivity [{config['connectivity']['method']}]: {'OK' if connected else 'FAILED'}")
+
+    if not connected:
+        print("Cannot reach update server — skipping update checks.")
+        return
+
+    # ── RPM updates ───────────────────────────────────────────────────────────
+    print("\nPending RPM updates:")
+    rpm_updates = get_rpm_updates()
+    if rpm_updates:
+        for pkg in rpm_updates:
+            print(f"  {pkg}")
+    else:
+        print("  (none)")
+
+    # ── TPM reseal ────────────────────────────────────────────────────────────
+    if config["tpm_reseal"]["enabled"]:
+        reseal_triggers = [
+            p for p in rpm_updates if kernel_or_shim_will_update([p])
+        ]
+        if reseal_triggers:
+            pcr_ids = config["tpm_reseal"].get("pcr_ids", [7])
+            print(f"\nTPM Reseal: YES (triggered by: {', '.join(reseal_triggers)})")
+            print(f"  PCR IDs : {pcr_ids}")
+            print(f"  Key file: {config['tpm_reseal']['luks_password_file']}")
+        else:
+            print("\nTPM Reseal: No (no kernel/shim updates pending)")
+    else:
+        print("\nTPM Reseal: Disabled in config")
+
+    # ── System flatpak updates ────────────────────────────────────────────────
+    if _flatpak_available():
+        print("\nPending system flatpak updates:")
+        sys_updates = get_system_flatpak_updates()
+        if sys_updates:
+            for app in sys_updates:
+                print(f"  {app}")
+        else:
+            print("  (none)")
+
+        # ── Per-user flatpak updates ──────────────────────────────────────────
+        print("\nPending user flatpak updates:")
+        users = get_users_to_update(config)
+        any_user_updates = False
+        for username, _ in users.items():
+            updates = get_user_flatpak_updates(username)
+            if updates:
+                any_user_updates = True
+                print(f"  {username}:")
+                for app in updates:
+                    print(f"    {app}")
+        if not any_user_updates:
+            print("  (none)")
+    else:
+        print("\nflatpak not installed — skipping flatpak status.")
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+
+def _usage():
+    name = Path(sys.argv[0]).name
+    print(f"Usage: {name} {{update|status|--do-reseal|--version}}", file=sys.stderr)
+
+
+def main():
+    if os.geteuid() != 0:
+        sys.exit("Error: tuxpatch must be run as root.")
+
+    if len(sys.argv) < 2:
+        _usage()
+        sys.exit(1)
+
+    command = sys.argv[1]
+
+    if command == "--version":
+        print(f"tuxpatch {VERSION}")
+        return
+
+    if command == "--do-reseal":
+        do_reseal()
+        return
+
+    config = load_config()
+
+    if command == "update":
+        cmd_update(config)
+    elif command == "status":
+        cmd_status(config)
+    else:
+        print(f"Unknown command: {command!r}", file=sys.stderr)
+        _usage()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

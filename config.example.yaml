@@ -1,0 +1,78 @@
+# /etc/tuxpatch/config
+# TuxPatch configuration — copy to /etc/tuxpatch/config and adjust.
+# Restrict permissions once the LUKS key path is set:
+#   chmod 600 /etc/tuxpatch/config
+
+# ── Connectivity ─────────────────────────────────────────────────────────────
+# How to verify the machine can reach the update infrastructure before patching.
+connectivity:
+  # method: one of ping | tcp | http
+  #   ping — ICMP echo to 'server'
+  #   tcp  — TCP connect to 'server':'port'
+  #   http — HTTP HEAD request to 'server' (prefix with http:// or https://)
+  method: ping
+  server: "updates.example.com"
+
+  # Used only for method: tcp / http
+  port: 443
+
+  # Seconds before the check is considered failed
+  timeout: 5
+
+# ── Users ─────────────────────────────────────────────────────────────────────
+# Which users get per-user (--user) flatpak updates.
+users:
+  # Local UID range to include (inclusive on both ends)
+  uid_range: [1000, 2000]
+
+  # AD/LDAP group names resolved via SSSD/getent.
+  # Members of these groups are included regardless of UID range.
+  # Leave empty ([]) to disable group-based inclusion.
+  sssd_groups:
+    - "domain users"
+    - "workstation-users"
+
+# ── Flatpak ───────────────────────────────────────────────────────────────────
+flatpak:
+  # Run /usr/bin/flat-manager-checkin after flatpak updates, if it exists.
+  flat_manager_checkin: true
+
+# ── TPM2 / LUKS Reseal ───────────────────────────────────────────────────────
+# When a kernel, shim, or grub package is updated, new PCR measurements are
+# produced at next boot.  The existing clevis/TPM2 binding (which was sealed
+# against the old measurements) would then fail to unseal the LUKS volume.
+#
+# tuxpatch handles this by:
+#   1. Building a temporary initrd that embeds the raw LUKS passphrase and
+#      omits clevis, so the first post-update boot can unlock the disk.
+#   2. On that boot a one-shot systemd service:
+#        a. Unbinds the old clevis slot(s) and rebinds against the NEW PCR
+#           values using the passphrase file to authorise the key-slot change.
+#        b. Regenerates the normal initrd (without the embedded passphrase).
+#        c. Removes the temporary initrd and boot entry.
+#        d. Reboots into the normal initrd — from now on clevis/TPM unseals
+#           the volume automatically as before.
+tpm_reseal:
+  # Set to false to skip the whole reseal workflow.
+  enabled: true
+
+  # Absolute path to a file containing the LUKS passphrase (binary or text).
+  # This file must be readable only by root (chmod 600, chown root:root).
+  # It is embedded into the temporary initrd at build time and read on-disk
+  # by the reseal service to authorise clevis rebinding.
+  luks_password_file: "/etc/tuxpatch/luks.key"
+
+  # TPM2 PCR banks to seal the volume against.
+  # The list can contain any combination of the values below.
+  # Default is [7] — Secure Boot state (changes on shim/grub updates).
+  #
+  # Common PCR values:
+  #   0  — Core BIOS / UEFI firmware code
+  #   1  — BIOS / UEFI configuration data
+  #   4  — Boot Manager (shim / GRUB EFI binary hash)
+  #   5  — Boot Manager configuration (GPT partition table)
+  #   7  — Secure Boot policy (DB, DBX, shim vendor cert)  ← recommended
+  #   8  — Kernel cmdline as measured by GRUB
+  #   9  — Initrd / kernel image content hash
+  #   11 — Unified Kernel Image (UKI) or BitLocker-compatible
+  pcr_ids: [7]
