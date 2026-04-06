@@ -26,7 +26,10 @@ users:
   uid_range: [1000, 2000]
 
   # AD/LDAP group names resolved via SSSD/getent.
-  # Members of these groups are included regardless of UID range.
+  # Members are looked up with 'getent group <name>', then each member's home
+  # dir is verified with 'getent passwd <username>'.
+  # This is the recommended way to include AD users whose UIDs fall outside
+  # uid_range (e.g. domain SID-derived UIDs in the hundreds of millions).
   # Leave empty ([]) to disable group-based inclusion.
   sssd_groups:
     - "domain users"

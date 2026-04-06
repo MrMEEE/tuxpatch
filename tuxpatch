@@ -153,21 +153,27 @@ def _get_sssd_group_members(groups: list) -> set:
 
 
 def get_users_to_update(config: dict) -> dict:
-    """Return {username: home_dir} for every user that should get flatpak updates."""
+    """
+    Return {username: home_dir} for every user that should get flatpak updates.
+
+    A user is included if any of the following are true:
+      - Their UID is within users.uid_range  (local accounts)
+      - They are a member of one of users.sssd_groups  (AD/LDAP accounts)
+        Home dir is resolved via 'getent passwd <username>'.
+    """
     uid_min, uid_max = config["users"]["uid_range"]
     sssd_groups = config["users"].get("sssd_groups", [])
-    sssd_members = _get_sssd_group_members(sssd_groups) if sssd_groups else set()
 
     no_login_shells = {"/sbin/nologin", "/bin/false", "/usr/sbin/nologin"}
+    users: dict = {}
 
+    # ── Local accounts by UID range ───────────────────────────────────────────
     r = subprocess.run(
         ["getent", "passwd"],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
     )
-
-    users: dict = {}
     for line in r.stdout.splitlines():
         parts = line.split(":")
         if len(parts) < 7:
@@ -177,13 +183,28 @@ def get_users_to_update(config: dict) -> dict:
             uid = int(uid_str)
         except ValueError:
             continue
-
-        in_range = uid_min <= uid <= uid_max
-        in_group = username in sssd_members
-
-        if (in_range or in_group) and home and Path(home).exists():
+        if uid_min <= uid <= uid_max and home and Path(home).exists():
             if shell not in no_login_shells:
                 users[username] = home
+
+    # ── AD/LDAP accounts by group membership ─────────────────────────────────
+    for username in _get_sssd_group_members(sssd_groups):
+        if username in users:
+            continue
+        pw = subprocess.run(
+            ["getent", "passwd", username],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        if pw.returncode != 0 or not pw.stdout.strip():
+            continue
+        pw_parts = pw.stdout.strip().split(":")
+        if len(pw_parts) < 7:
+            continue
+        home, shell = pw_parts[5], pw_parts[6]
+        if home and Path(home).exists() and shell not in no_login_shells:
+            users[username] = home
 
     return users
 
@@ -210,10 +231,12 @@ def get_system_flatpak_updates() -> list:
 
 
 def get_user_flatpak_updates(username: str) -> list:
+    # XDG_RUNTIME_DIR is required for flatpak --user to locate the user installation.
+    # runuser does not create a logind session, so it is not set automatically.
     r = subprocess.run(
         [
             "runuser", "-l", username, "-c",
-            "flatpak --user remote-ls --updates --columns=application 2>/dev/null",
+            "XDG_RUNTIME_DIR=/run/user/$(id -u) flatpak --user remote-ls --updates --columns=application 2>/dev/null",
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -226,7 +249,7 @@ def update_user_flatpaks(username: str) -> bool:
     r = subprocess.run(
         [
             "runuser", "-l", username, "-c",
-            "flatpak --user update -y --noninteractive 2>&1",
+            "XDG_RUNTIME_DIR=/run/user/$(id -u) flatpak --user update -y --noninteractive 2>&1",
         ],
         text=True,
     )
