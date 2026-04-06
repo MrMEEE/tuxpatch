@@ -1,0 +1,145 @@
+name: Build RPM
+
+# ── Only run on version tags — no manual triggers, no branch pushes ───────────
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: write   # needed to create GitHub Releases
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  build-rpm:
+    name: RPM — ${{ matrix.distro_label }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro_label:  CentOS Stream 9
+            container:     quay.io/centos/centos:stream9
+            artifact_name: centos-stream-9
+
+          - distro_label:  CentOS Stream 10
+            container:     quay.io/centos/centos:stream10
+            artifact_name: centos-stream-10
+
+    container:
+      image: ${{ matrix.container }}
+      options: --privileged
+
+    steps:
+      # ── Install build toolchain ─────────────────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          dnf install -y epel-release 2>/dev/null || true
+          dnf install -y \
+            rpm-build \
+            rpmdevtools \
+            git \
+            python3
+          rpmdev-setuptree
+
+      # ── Checkout source ─────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Mark workspace as git safe directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # ── Determine version from tag ──────────────────────────────────────────
+      - name: Determine version
+        id: ver
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Building version: ${VERSION}"
+
+      # ── Create source tarball ───────────────────────────────────────────────
+      - name: Create source tarball
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          TARBALL="${HOME}/rpmbuild/SOURCES/tuxpatch-${VERSION}.tar.gz"
+          git archive \
+            --format=tar.gz \
+            --prefix="tuxpatch-${VERSION}/" \
+            HEAD \
+            > "${TARBALL}"
+          ls -lh "${TARBALL}"
+
+      # ── Build RPM ───────────────────────────────────────────────────────────
+      - name: Build RPM
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          rpmbuild -ba packaging/tuxpatch.spec \
+            --define "version_string ${VERSION}" \
+            --define "_topdir ${HOME}/rpmbuild"
+
+      # ── List output ─────────────────────────────────────────────────────────
+      - name: List built RPMs
+        run: find "${HOME}/rpmbuild/RPMS" -name '*.rpm' | sort
+
+      # ── Upload as workflow artefact ─────────────────────────────────────────
+      - name: Upload RPM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: "rpms-${{ matrix.artifact_name }}"
+          path: ~/rpmbuild/RPMS/**/*.rpm
+          if-no-files-found: error
+
+  # ────────────────────────────────────────────────────────────────────────────
+  create-release:
+    name: Create GitHub Release
+    needs: build-rpm
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all RPM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-rpms/
+
+      - name: List release assets
+        run: find release-rpms/ -name '*.rpm' | sort
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-rpms/**/*.rpm
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          body: |
+            ## Installation
+
+            ```bash
+            dnf install tuxpatch-<version>.noarch.rpm
+            ```
+
+            After installing, copy the example config and edit it:
+
+            ```bash
+            cp /etc/tuxpatch/config.example.yaml /etc/tuxpatch/config
+            vi /etc/tuxpatch/config
+            ```
+
+            Then run as root:
+
+            ```bash
+            tuxpatch update    # apply updates (DNF + Flatpak + optional TPM reseal)
+            tuxpatch status    # show pending updates without applying them
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
