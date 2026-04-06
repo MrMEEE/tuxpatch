@@ -51,7 +51,7 @@ install -D -m 0755 tuxpatch %{buildroot}%{_bindir}/tuxpatch
 # ── Config skeleton ───────────────────────────────────────────────────────────
 install -d %{buildroot}%{_sysconfdir}/tuxpatch
 install -D -m 0640 config.example.yaml \
-    %{buildroot}%{_sysconfdir}/tuxpatch/config.yaml
+    %{buildroot}%{_sysconfdir}/tuxpatch/config
 
 # ── State directory ───────────────────────────────────────────────────────────
 install -d %{buildroot}%{_sharedstatedir}/tuxpatch
@@ -60,7 +60,7 @@ install -d %{buildroot}%{_sharedstatedir}/tuxpatch
 %license LICENSE
 %{_bindir}/tuxpatch
 %dir %{_sysconfdir}/tuxpatch
-%config(noreplace) %{_sysconfdir}/tuxpatch/config.yaml
+%config(noreplace) %{_sysconfdir}/tuxpatch/config
 %dir %attr(0700, root, root) %{_sharedstatedir}/tuxpatch
 
 %changelog
