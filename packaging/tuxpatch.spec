@@ -64,3 +64,6 @@ install -d %{buildroot}%{_sharedstatedir}/tuxpatch
 %dir %attr(0700, root, root) %{_sharedstatedir}/tuxpatch
 
 %changelog
+
+* Mon Apr 06 2026 Release Bot <release@tuxpatch> - 1.0.1-1
+- Release 1.0.1
