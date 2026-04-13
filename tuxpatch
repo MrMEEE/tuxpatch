@@ -58,9 +58,53 @@ DEFAULTS = {
         "luks_password_file": "/etc/tuxpatch/luks.key",
         "pcr_ids": [7],
     },
+    "logging": {
+        "path": "/var/log/tuxpatch.log",
+        "reset_on_run": True,
+    },
 }
 
 # ── Lock file ─────────────────────────────────────────────────────────────────
+
+
+class _Tee:
+    """Write to both a file and the original stream simultaneously."""
+    def __init__(self, stream, fh):
+        self._stream = stream
+        self._fh = fh
+
+    def write(self, data):
+        self._stream.write(data)
+        self._fh.write(data)
+        self._fh.flush()
+
+    def flush(self):
+        self._stream.flush()
+        self._fh.flush()
+
+    def fileno(self):
+        return self._stream.fileno()
+
+    def isatty(self):
+        return self._stream.isatty()
+
+
+_log_fh = None  # kept open so it is never garbage-collected
+
+
+def setup_logging(config: dict) -> None:
+    global _log_fh
+    log_path = config["logging"]["path"]
+    reset = config["logging"]["reset_on_run"]
+    mode = "w" if reset else "a"
+    try:
+        _log_fh = open(log_path, mode, buffering=1)
+        import datetime
+        _log_fh.write(f"\n=== tuxpatch run started {datetime.datetime.now().isoformat(timespec='seconds')} ===\n")
+        sys.stdout = _Tee(sys.__stdout__, _log_fh)
+        sys.stderr = _Tee(sys.__stderr__, _log_fh)
+    except OSError as e:
+        print(f"Warning: cannot open log file {log_path!r}: {e}", file=sys.stderr)
 
 
 def acquire_lock() -> None:
@@ -1063,6 +1107,7 @@ def main():
     acquire_lock()
     try:
         config = load_config()
+        setup_logging(config)
 
         if command == "update":
             cmd_update(config)

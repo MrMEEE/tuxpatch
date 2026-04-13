@@ -3,6 +3,18 @@
 # Restrict permissions once the LUKS key path is set:
 #   chmod 600 /etc/tuxpatch/config
 
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging:
+  # Absolute path to the log file.  All stdout and stderr (including debug
+  # output from flatpak subprocesses) is written here in addition to the
+  # terminal, so cron job output is always available for inspection.
+  path: /var/log/tuxpatch.log
+
+  # If true (default), the log file is truncated at the start of each run so
+  # it only contains output from the most recent run.
+  # Set to false to keep a running append log across all runs.
+  reset_on_run: true
+
 # ── Connectivity ─────────────────────────────────────────────────────────────
 # How to verify the machine can reach the update infrastructure before patching.
 connectivity:
