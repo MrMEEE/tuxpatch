@@ -271,17 +271,36 @@ def get_system_flatpak_updates() -> list:
     return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
 
 
-def get_user_flatpak_updates(uid: int, gid: int, home: str) -> list:
+def _user_env(uid: int, username: str, home: str) -> dict:
+    """Minimal env for running flatpak --user without a login session.
+
+    GLib falls back to USER/LOGNAME/HOME when getpwuid() fails (e.g. SSSD
+    cache miss in cron), so setting them here prevents the
+    'getpwnam() failed' error from flatpak.
+    """
+    return {
+        "PATH": "/usr/bin:/bin",
+        "HOME": home,
+        "USER": username,
+        "LOGNAME": username,
+        "USERNAME": username,
+        "XDG_RUNTIME_DIR": f"/run/user/{uid}",
+        "XDG_DATA_HOME": f"{home}/.local/share",
+        # Flatpak uses a peer-to-peer D-Bus socket in XDG_RUNTIME_DIR.
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus",
+    }
+
+
+def get_user_flatpak_updates(uid: int, gid: int, username: str, home: str) -> list:
     # Run flatpak as the target user via direct setuid/setgid so that no
     # getpwnam() call is needed — avoids SSSD failures in cron environments.
     def _demote():
         os.setgid(gid)
         os.setuid(uid)
-    env = {"HOME": home, "XDG_RUNTIME_DIR": f"/run/user/{uid}", "PATH": "/usr/bin:/bin"}
     r = subprocess.run(
         ["flatpak", "--user", "remote-ls", "--updates", "--columns=application"],
         preexec_fn=_demote,
-        env=env,
+        env=_user_env(uid, username, home),
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
@@ -289,15 +308,14 @@ def get_user_flatpak_updates(uid: int, gid: int, home: str) -> list:
     return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
 
 
-def update_user_flatpaks(uid: int, gid: int, home: str) -> bool:
+def update_user_flatpaks(uid: int, gid: int, username: str, home: str) -> bool:
     def _demote():
         os.setgid(gid)
         os.setuid(uid)
-    env = {"HOME": home, "XDG_RUNTIME_DIR": f"/run/user/{uid}", "PATH": "/usr/bin:/bin"}
     r = subprocess.run(
         ["flatpak", "--user", "update", "-y", "--noninteractive"],
         preexec_fn=_demote,
-        env=env,
+        env=_user_env(uid, username, home),
         text=True,
     )
     return r.returncode == 0
@@ -881,7 +899,7 @@ def cmd_update(config: dict):
             print(f"Updating user flatpaks for {len(users)} user(s)...")
             for username, (uid, gid, home) in users.items():
                 print(f"  [{username}] flatpak --user update")
-                update_user_flatpaks(uid, gid, home)
+                update_user_flatpaks(uid, gid, username, home)
         else:
             print("No applicable users found for flatpak updates.")
 
@@ -991,7 +1009,7 @@ def cmd_status(config: dict):
         users = get_users_to_update(config)
         any_user_updates = False
         for username, (uid, gid, home) in users.items():
-            updates = get_user_flatpak_updates(uid, gid, home)
+            updates = get_user_flatpak_updates(uid, gid, username, home)
             if updates:
                 any_user_updates = True
                 print(f"  {username}:")
