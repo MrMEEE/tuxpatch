@@ -292,32 +292,43 @@ def _user_env(uid: int, username: str, home: str) -> dict:
 
 
 def get_user_flatpak_updates(uid: int, gid: int, username: str, home: str) -> list:
-    # Run flatpak as the target user via direct setuid/setgid so that no
-    # getpwnam() call is needed — avoids SSSD failures in cron environments.
+    env = _user_env(uid, username, home)
+    print(f"    [DEBUG] get_user_flatpak_updates: user={username} uid={uid} gid={gid} home={home}", file=sys.stderr)
+    print(f"    [DEBUG] env={env}", file=sys.stderr)
     def _demote():
         os.setgid(gid)
         os.setuid(uid)
     r = subprocess.run(
         ["flatpak", "--user", "remote-ls", "--updates", "--columns=application"],
         preexec_fn=_demote,
-        env=_user_env(uid, username, home),
+        env=env,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         text=True,
     )
+    print(f"    [DEBUG] flatpak remote-ls rc={r.returncode}", file=sys.stderr)
+    if r.stderr.strip():
+        print(f"    [DEBUG] flatpak remote-ls stderr: {r.stderr.strip()}", file=sys.stderr)
     return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
 
 
 def update_user_flatpaks(uid: int, gid: int, username: str, home: str) -> bool:
+    env = _user_env(uid, username, home)
+    print(f"    [DEBUG] update_user_flatpaks: user={username} uid={uid} gid={gid} home={home}", file=sys.stderr)
     def _demote():
         os.setgid(gid)
         os.setuid(uid)
     r = subprocess.run(
         ["flatpak", "--user", "update", "-y", "--noninteractive"],
         preexec_fn=_demote,
-        env=_user_env(uid, username, home),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
     )
+    print(f"    [DEBUG] flatpak update rc={r.returncode}", file=sys.stderr)
+    if r.stderr.strip():
+        print(f"    [DEBUG] flatpak update stderr: {r.stderr.strip()}", file=sys.stderr)
     return r.returncode == 0
 
 
