@@ -20,7 +20,8 @@ except ImportError:
 VERSION = "1.0.3"
 
 CONFIG_PATH = "/etc/tuxpatch/config"
-STATE_DIR = "/var/lib/tuxpatch"
+LOCKFILE   = "/var/run/tuxpatch.pid"
+STATE_DIR  = "/var/lib/tuxpatch"
 RESEAL_PENDING_FILE = f"{STATE_DIR}/reseal.pending"
 RESEAL_SERVICE_NAME = "tuxpatch-reseal.service"
 RESEAL_SERVICE_PATH = f"/etc/systemd/system/{RESEAL_SERVICE_NAME}"
@@ -58,6 +59,39 @@ DEFAULTS = {
         "pcr_ids": [7],
     },
 }
+
+# ── Lock file ─────────────────────────────────────────────────────────────────
+
+
+def acquire_lock() -> None:
+    """
+    Write our PID to LOCKFILE, or exit if another tuxpatch process is running.
+    Uses O_CREAT|O_EXCL for atomic creation; falls back to stale-PID detection
+    when the file already exists.
+    """
+    try:
+        fd = os.open(LOCKFILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+    except FileExistsError:
+        try:
+            pid = int(Path(LOCKFILE).read_text().strip())
+        except (ValueError, OSError):
+            pid = None
+
+        if pid and Path(f"/proc/{pid}").exists():
+            sys.exit("Tuxpatch already running")
+
+        # Stale lockfile — previous run crashed without cleanup
+        Path(LOCKFILE).write_text(str(os.getpid()))
+
+
+def release_lock() -> None:
+    try:
+        Path(LOCKFILE).unlink()
+    except OSError:
+        pass
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -154,7 +188,10 @@ def _get_sssd_group_members(groups: list) -> set:
 
 def get_users_to_update(config: dict) -> dict:
     """
-    Return {username: home_dir} for every user that should get flatpak updates.
+    Return {username: (uid, gid, home)} for every user that should get
+    flatpak updates.  UID and GID are captured here, while getent is
+    available, so flatpak commands can be run via direct setuid/setgid
+    without any further NSS/getpwnam lookups (important for cron).
 
     A user is included if any of the following are true:
       - Their UID is within users.uid_range  (local accounts)
@@ -178,14 +215,14 @@ def get_users_to_update(config: dict) -> dict:
         parts = line.split(":")
         if len(parts) < 7:
             continue
-        username, _, uid_str, _, _, home, shell = parts[:7]
+        username, _, uid_str, gid_str, _, home, shell = parts[:7]
         try:
-            uid = int(uid_str)
+            uid, gid = int(uid_str), int(gid_str)
         except ValueError:
             continue
         if uid_min <= uid <= uid_max and home and Path(home).exists():
             if shell not in no_login_shells:
-                users[username] = home
+                users[username] = (uid, gid, home)
 
     # ── AD/LDAP accounts by group membership ─────────────────────────────────
     for username in _get_sssd_group_members(sssd_groups):
@@ -202,9 +239,13 @@ def get_users_to_update(config: dict) -> dict:
         pw_parts = pw.stdout.strip().split(":")
         if len(pw_parts) < 7:
             continue
-        home, shell = pw_parts[5], pw_parts[6]
+        _, _, uid_str, gid_str, _, home, shell = pw_parts[:7]
+        try:
+            uid, gid = int(uid_str), int(gid_str)
+        except ValueError:
+            continue
         if home and Path(home).exists() and shell not in no_login_shells:
-            users[username] = home
+            users[username] = (uid, gid, home)
 
     return users
 
@@ -230,14 +271,17 @@ def get_system_flatpak_updates() -> list:
     return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
 
 
-def get_user_flatpak_updates(username: str) -> list:
-    # XDG_RUNTIME_DIR is required for flatpak --user to locate the user installation.
-    # runuser does not create a logind session, so it is not set automatically.
+def get_user_flatpak_updates(uid: int, gid: int, home: str) -> list:
+    # Run flatpak as the target user via direct setuid/setgid so that no
+    # getpwnam() call is needed — avoids SSSD failures in cron environments.
+    def _demote():
+        os.setgid(gid)
+        os.setuid(uid)
+    env = {"HOME": home, "XDG_RUNTIME_DIR": f"/run/user/{uid}", "PATH": "/usr/bin:/bin"}
     r = subprocess.run(
-        [
-            "runuser", "-l", username, "-c",
-            "XDG_RUNTIME_DIR=/run/user/$(id -u) flatpak --user remote-ls --updates --columns=application 2>/dev/null",
-        ],
+        ["flatpak", "--user", "remote-ls", "--updates", "--columns=application"],
+        preexec_fn=_demote,
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
@@ -245,12 +289,15 @@ def get_user_flatpak_updates(username: str) -> list:
     return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
 
 
-def update_user_flatpaks(username: str) -> bool:
+def update_user_flatpaks(uid: int, gid: int, home: str) -> bool:
+    def _demote():
+        os.setgid(gid)
+        os.setuid(uid)
+    env = {"HOME": home, "XDG_RUNTIME_DIR": f"/run/user/{uid}", "PATH": "/usr/bin:/bin"}
     r = subprocess.run(
-        [
-            "runuser", "-l", username, "-c",
-            "XDG_RUNTIME_DIR=/run/user/$(id -u) flatpak --user update -y --noninteractive 2>&1",
-        ],
+        ["flatpak", "--user", "update", "-y", "--noninteractive"],
+        preexec_fn=_demote,
+        env=env,
         text=True,
     )
     return r.returncode == 0
@@ -832,9 +879,9 @@ def cmd_update(config: dict):
         users = get_users_to_update(config)
         if users:
             print(f"Updating user flatpaks for {len(users)} user(s)...")
-            for username, _ in users.items():
+            for username, (uid, gid, home) in users.items():
                 print(f"  [{username}] flatpak --user update")
-                update_user_flatpaks(username)
+                update_user_flatpaks(uid, gid, home)
         else:
             print("No applicable users found for flatpak updates.")
 
@@ -943,8 +990,8 @@ def cmd_status(config: dict):
         print("\nPending user flatpak updates:")
         users = get_users_to_update(config)
         any_user_updates = False
-        for username, _ in users.items():
-            updates = get_user_flatpak_updates(username)
+        for username, (uid, gid, home) in users.items():
+            updates = get_user_flatpak_updates(uid, gid, home)
             if updates:
                 any_user_updates = True
                 print(f"  {username}:")
@@ -978,20 +1025,26 @@ def main():
         print(f"tuxpatch {VERSION}")
         return
 
+    # --do-reseal runs at boot inside a one-shot service; skip the lock so a
+    # manual invocation of 'tuxpatch update' in parallel doesn't block it.
     if command == "--do-reseal":
         do_reseal()
         return
 
-    config = load_config()
+    acquire_lock()
+    try:
+        config = load_config()
 
-    if command == "update":
-        cmd_update(config)
-    elif command == "status":
-        cmd_status(config)
-    else:
-        print(f"Unknown command: {command!r}", file=sys.stderr)
-        _usage()
-        sys.exit(1)
+        if command == "update":
+            cmd_update(config)
+        elif command == "status":
+            cmd_status(config)
+        else:
+            print(f"Unknown command: {command!r}", file=sys.stderr)
+            _usage()
+            sys.exit(1)
+    finally:
+        release_lock()
 
 
 if __name__ == "__main__":
