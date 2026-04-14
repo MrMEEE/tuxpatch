@@ -70,6 +70,9 @@ install -D -m 0644 packaging/tuxpatch.cron \
 
 %changelog
 
+* Tue Apr 14 2026 Release Bot <release@tuxpatch> - 1.0.5-1
+- Release 1.0.5
+
 * Mon Apr 13 2026 Release Bot <release@tuxpatch> - 1.0.4-1
 - Release 1.0.4
 
