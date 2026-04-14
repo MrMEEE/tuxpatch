@@ -1,0 +1,11 @@
+# /etc/cron.d/tuxpatch
+# Run tuxpatch as root to apply system updates.
+#
+# NOTE: The username field (root) between the schedule and the command is
+# required for cron.d files — without it crond will log:
+#   "ERROR (getpwnam() failed - user unknown)"
+#
+# Uncomment the line below to enable automatic updates every 15 minutes.
+# Adjust the schedule to taste (https://crontab.guru).
+#
+#*/15 * * * * root /usr/bin/tuxpatch update

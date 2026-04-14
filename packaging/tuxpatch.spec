@@ -56,12 +56,17 @@ install -D -m 0640 config.example.yaml \
 # ── State directory ───────────────────────────────────────────────────────────
 install -d %{buildroot}%{_sharedstatedir}/tuxpatch
 
+# ── Cron job (disabled by default) ───────────────────────────────────────────
+install -D -m 0644 packaging/tuxpatch.cron \
+    %{buildroot}%{_sysconfdir}/cron.d/tuxpatch
+
 %files
 %license LICENSE
 %{_bindir}/tuxpatch
 %dir %{_sysconfdir}/tuxpatch
 %config(noreplace) %{_sysconfdir}/tuxpatch/config
 %dir %attr(0700, root, root) %{_sharedstatedir}/tuxpatch
+%config(noreplace) %{_sysconfdir}/cron.d/tuxpatch
 
 %changelog
 
