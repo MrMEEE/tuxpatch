@@ -69,7 +69,7 @@ flatpak:
 #           the volume automatically as before.
 tpm_reseal:
   # Set to false to skip the whole reseal workflow.
-  enabled: true
+  enabled: false
 
   # Absolute path to a file containing the LUKS passphrase (binary or text).
   # This file must be readable only by root (chmod 600, chown root:root).
@@ -91,3 +91,30 @@ tpm_reseal:
   #   9  — Initrd / kernel image content hash
   #   11 — Unified Kernel Image (UKI) or BitLocker-compatible
   pcr_ids: [7]
+
+# ── Notifications ─────────────────────────────────────────────────────────────
+# Desktop notifications are delivered via org.freedesktop.Notifications (D-Bus)
+# directly to each user's session bus at /run/user/<uid>/bus.
+# Notifications are sent only to users who have an active graphical session
+# (i.e. the socket exists).  Works on both KDE and GNOME.
+# All notifications are persistent (urgency=critical, no auto-dismiss).
+notifications:
+  # RPM package names whose update triggers the "system configuration" notice.
+  # Add any packages here that apply site-specific configuration.
+  migrate_packages:
+    - tuxmigrate
+
+  # Message for per-user flatpak updates.  {packages} is replaced with a
+  # newline-separated list of updated application IDs.
+  msg_flatpak_updated: "The following flatpaks have been updated:\n{packages}"
+
+  # Message when RPM packages were updated (generic — sent when neither of
+  # the two conditions below apply).
+  msg_rpm_updated: "The system has been updated"
+
+  # Message when a kernel package was updated.
+  msg_kernel_updated: "A new system kernel has been installed, please reboot."
+
+  # Message when a package from migrate_packages was updated.
+  msg_migrate_updated: "New system configuration has been applied, the system might need a reboot for all changes to apply"
+

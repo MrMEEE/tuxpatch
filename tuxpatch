@@ -62,6 +62,15 @@ DEFAULTS = {
         "path": "/var/log/tuxpatch.log",
         "reset_on_run": True,
     },
+    "notifications": {
+        # Package names whose update triggers the migrate notification.
+        "migrate_packages": ["tuxmigrate"],
+        # Message templates — use {packages} for a newline-separated list.
+        "msg_flatpak_updated": "The following flatpaks have been updated:\n{packages}",
+        "msg_rpm_updated": "The system has been updated",
+        "msg_kernel_updated": "A new system kernel has been installed, please reboot.",
+        "msg_migrate_updated": "New system configuration has been applied, the system might need a reboot for all changes to apply",
+    },
 }
 
 # ── Lock file ─────────────────────────────────────────────────────────────────
@@ -337,8 +346,6 @@ def _user_env(uid: int, username: str, home: str) -> dict:
 
 def get_user_flatpak_updates(uid: int, gid: int, username: str, home: str) -> list:
     env = _user_env(uid, username, home)
-    print(f"    [DEBUG] get_user_flatpak_updates: user={username} uid={uid} gid={gid} home={home}", file=sys.stderr)
-    print(f"    [DEBUG] env={env}", file=sys.stderr)
     def _demote():
         os.setgid(gid)
         os.setuid(uid)
@@ -347,18 +354,14 @@ def get_user_flatpak_updates(uid: int, gid: int, username: str, home: str) -> li
         preexec_fn=_demote,
         env=env,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
         text=True,
     )
-    print(f"    [DEBUG] flatpak remote-ls rc={r.returncode}", file=sys.stderr)
-    if r.stderr.strip():
-        print(f"    [DEBUG] flatpak remote-ls stderr: {r.stderr.strip()}", file=sys.stderr)
     return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
 
 
 def update_user_flatpaks(uid: int, gid: int, username: str, home: str) -> bool:
     env = _user_env(uid, username, home)
-    print(f"    [DEBUG] update_user_flatpaks: user={username} uid={uid} gid={gid} home={home}", file=sys.stderr)
     def _demote():
         os.setgid(gid)
         os.setuid(uid)
@@ -367,12 +370,9 @@ def update_user_flatpaks(uid: int, gid: int, username: str, home: str) -> bool:
         preexec_fn=_demote,
         env=env,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
         text=True,
     )
-    print(f"    [DEBUG] flatpak update rc={r.returncode}", file=sys.stderr)
-    if r.stderr.strip():
-        print(f"    [DEBUG] flatpak update stderr: {r.stderr.strip()}", file=sys.stderr)
     return r.returncode == 0
 
 
@@ -382,6 +382,55 @@ def update_system_flatpaks() -> bool:
         text=True,
     )
     return r.returncode == 0
+
+
+# ── Notifications ─────────────────────────────────────────────────────────────
+
+
+def notify_user(uid: int, gid: int, home: str, username: str, summary: str, body: str = "") -> None:
+    """Send a persistent (urgency=critical, timeout=0) desktop notification
+    to an arbitrary user's session bus without requiring notify-send.
+    Works on both KDE and GNOME via org.freedesktop.Notifications.
+    """
+    bus = f"/run/user/{uid}/bus"
+    if not Path(bus).exists():
+        return
+
+    full_text = f"{summary}\n{body}".strip() if body else summary
+
+    def _demote():
+        os.setgid(gid)
+        os.setuid(uid)
+
+    subprocess.run(
+        [
+            "dbus-send",
+            "--session",
+            f"--address=unix:path={bus}",
+            "--type=method_call",
+            "--dest=org.freedesktop.Notifications",
+            "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications.Notify",
+            "string:tuxpatch",   # app_name
+            "uint32:0",          # replaces_id
+            "string:system-software-update",  # app_icon
+            f"string:{summary}",  # summary
+            f"string:{full_text}",  # body
+            "array:string:",     # actions
+            "dict:string:variant:urgency,byte:2",  # hints: urgency=critical
+            "int32:0",           # expire_timeout (0 = never)
+        ],
+        preexec_fn=_demote,
+        env=_user_env(uid, username, home),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def notify_all_users(users: dict, summary: str, body: str = "") -> None:
+    """Send the same notification to every user in the users dict."""
+    for username, (uid, gid, home) in users.items():
+        notify_user(uid, gid, home, username, summary, body)
 
 
 def run_flat_manager_checkin():
@@ -426,6 +475,11 @@ def _pkg_base(pkg_name: str) -> str:
     """Strip epoch, version, release, arch from a package name."""
     # names from 'dnf check-update' look like: kernel.x86_64 or kernel-core.x86_64
     return pkg_name.split(".")[0]
+
+
+def _pkg_base_lower(pkg: str) -> str:
+    """Return lowercase base package name (strip arch suffix)."""
+    return _pkg_base(pkg).lower()
 
 
 def kernel_or_shim_will_update(rpm_updates: list) -> bool:
@@ -933,6 +987,9 @@ def do_reseal():
 
 
 def cmd_update(config: dict):
+    notif = config.get("notifications", DEFAULTS["notifications"])
+    migrate_pkgs = {p.lower() for p in notif.get("migrate_packages", ["tuxmigrate"])}
+
     # ── 1. Connectivity ───────────────────────────────────────────────────────
     print("Checking connectivity...")
     if not check_connectivity(config):
@@ -946,15 +1003,31 @@ def cmd_update(config: dict):
         config["tpm_reseal"]["enabled"]
         and kernel_or_shim_will_update(rpm_updates)
     )
+    kernel_will_update = any(
+        _pkg_base_lower(p).startswith("kernel") for p in rpm_updates
+    )
+    migrate_will_update = any(
+        _pkg_base_lower(p) in migrate_pkgs for p in rpm_updates
+    )
 
     # ── 3. Update per-user flatpaks ───────────────────────────────────────────
+    users = {}
     if _flatpak_available():
         users = get_users_to_update(config)
         if users:
             print(f"Updating user flatpaks for {len(users)} user(s)...")
             for username, (uid, gid, home) in users.items():
                 print(f"  [{username}] flatpak --user update")
+                # Snapshot which updates are pending before and after so we
+                # know exactly what was installed to put in the notification.
+                before = set(get_user_flatpak_updates(uid, gid, username, home))
                 update_user_flatpaks(uid, gid, username, home)
+                after = set(get_user_flatpak_updates(uid, gid, username, home))
+                updated = before - after
+                if updated:
+                    pkg_list = "\n".join(sorted(updated))
+                    msg = notif["msg_flatpak_updated"].format(packages=pkg_list)
+                    notify_user(uid, gid, home, username, "TuxPatch", msg)
         else:
             print("No applicable users found for flatpak updates.")
 
@@ -970,8 +1043,18 @@ def cmd_update(config: dict):
 
     # ── 6. Update system packages ─────────────────────────────────────────────
     print("Updating system packages (dnf upgrade)...")
-    if not update_system():
+    rpm_did_update = update_system()
+    if not rpm_did_update:
         print("Warning: dnf upgrade reported a non-zero exit code.", file=sys.stderr)
+
+    # ── 7. RPM notifications ──────────────────────────────────────────────────
+    if rpm_did_update and rpm_updates and users:
+        if kernel_will_update:
+            notify_all_users(users, "TuxPatch", notif["msg_kernel_updated"])
+        if migrate_will_update:
+            notify_all_users(users, "TuxPatch", notif["msg_migrate_updated"])
+        if not kernel_will_update and not migrate_will_update:
+            notify_all_users(users, "TuxPatch", notif["msg_rpm_updated"])
 
     # ── 7. TPM reseal setup (if needed) ──────────────────────────────────────
     if needs_reseal:
