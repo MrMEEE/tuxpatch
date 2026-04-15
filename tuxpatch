@@ -388,38 +388,31 @@ def update_system_flatpaks() -> bool:
 
 
 def notify_user(uid: int, gid: int, home: str, username: str, summary: str, body: str = "") -> None:
-    """Send a persistent (urgency=critical, timeout=0) desktop notification
-    to an arbitrary user's session bus without requiring notify-send.
+    """Send a persistent (urgency=critical, expire-time=0) desktop notification
+    to an arbitrary user's session bus via notify-send.
     Works on both KDE and GNOME via org.freedesktop.Notifications.
     """
     bus = f"/run/user/{uid}/bus"
     if not Path(bus).exists():
         return
 
-    full_text = f"{summary}\n{body}".strip() if body else summary
-
     def _demote():
         os.setgid(gid)
         os.setuid(uid)
 
+    cmd = [
+        "notify-send",
+        "--urgency=critical",
+        "--expire-time=0",
+        "--app-name=tuxpatch",
+        "--icon=system-software-update",
+        summary,
+    ]
+    if body:
+        cmd.append(body)
+
     subprocess.run(
-        [
-            "dbus-send",
-            "--session",
-            f"--address=unix:path={bus}",
-            "--type=method_call",
-            "--dest=org.freedesktop.Notifications",
-            "/org/freedesktop/Notifications",
-            "org.freedesktop.Notifications.Notify",
-            "string:tuxpatch",   # app_name
-            "uint32:0",          # replaces_id
-            "string:system-software-update",  # app_icon
-            f"string:{summary}",  # summary
-            f"string:{full_text}",  # body
-            "array:string:",     # actions
-            "dict:string:variant:urgency,byte:2",  # hints: urgency=critical
-            "int32:0",           # expire_timeout (0 = never)
-        ],
+        cmd,
         preexec_fn=_demote,
         env=_user_env(uid, username, home),
         stdout=subprocess.DEVNULL,

@@ -18,6 +18,7 @@ BuildRequires:  python3
 # Runtime
 Requires:       python3
 Requires:       python3-pyyaml
+Requires:       libnotify
 
 # Optional but expected on managed workstations — listed as weak deps so the
 # RPM installs cleanly on minimal / container images used for testing.
