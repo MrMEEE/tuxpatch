@@ -61,6 +61,10 @@ install -d %{buildroot}%{_sharedstatedir}/tuxpatch
 install -D -m 0644 packaging/tuxpatch.cron \
     %{buildroot}%{_sysconfdir}/cron.d/tuxpatch
 
+# ── Desktop entry (notification identity for KDE/GNOME history) ────────────
+install -D -m 0644 packaging/tuxpatch.desktop \
+    %{buildroot}%{_datadir}/applications/tuxpatch.desktop
+
 %files
 %license LICENSE
 %{_bindir}/tuxpatch
@@ -68,6 +72,7 @@ install -D -m 0644 packaging/tuxpatch.cron \
 %config(noreplace) %{_sysconfdir}/tuxpatch/config
 %dir %attr(0700, root, root) %{_sharedstatedir}/tuxpatch
 %config(noreplace) %{_sysconfdir}/cron.d/tuxpatch
+%{_datadir}/applications/tuxpatch.desktop
 
 %changelog
 

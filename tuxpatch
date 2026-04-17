@@ -388,9 +388,10 @@ def update_system_flatpaks() -> bool:
 
 
 def notify_user(uid: int, gid: int, home: str, username: str, summary: str, body: str = "") -> None:
-    """Send a persistent (urgency=critical, expire-time=0) desktop notification
-    to an arbitrary user's session bus via notify-send.
-    Works on both KDE and GNOME via org.freedesktop.Notifications.
+    """Send a persistent desktop notification to a user's session bus.
+
+    Prefer direct D-Bus calls via gdbus (more reliable KDE hint handling),
+    then fall back to notify-send.
     """
     bus = f"/run/user/{uid}/bus"
     if not Path(bus).exists():
@@ -400,10 +401,49 @@ def notify_user(uid: int, gid: int, home: str, username: str, summary: str, body
         os.setgid(gid)
         os.setuid(uid)
 
+    env = _user_env(uid, username, home)
+
+    gdbus_cmd = [
+        "gdbus",
+        "call",
+        "--session",
+        "--dest",
+        "org.freedesktop.Notifications",
+        "--object-path",
+        "/org/freedesktop/Notifications",
+        "--method",
+        "org.freedesktop.Notifications.Notify",
+        "tuxpatch",  # app_name
+        "0",  # replaces_id
+        "system-software-update",  # app_icon
+        summary,
+        body,
+        "[]",  # actions
+        "{'urgency': <byte 2>, 'resident': <true>, 'transient': <false>, 'desktop-entry': <'tuxpatch'>, 'x-kde-origin-name': <'tuxpatch'>}",
+        "0",  # expire_timeout (0 = never expire)
+    ]
+    r = subprocess.run(
+        gdbus_cmd,
+        preexec_fn=_demote,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if r.returncode == 0:
+        return
+
     cmd = [
         "notify-send",
         "--urgency=critical",
+        # 0 requests "never expire" per org.freedesktop.Notifications.
         "--expire-time=0",
+        # Provide a stable app identity so KDE can keep proper history entries.
+        "--hint=string:desktop-entry:tuxpatch",
+        "--hint=string:x-kde-origin-name:tuxpatch",
+        # Hint to keep it in the notification center/tray where supported.
+        "--hint=boolean:resident:true",
+        # Explicitly mark as non-transient so it should be stored in history.
+        "--hint=boolean:transient:false",
         "--app-name=tuxpatch",
         "--icon=system-software-update",
         summary,
@@ -414,7 +454,7 @@ def notify_user(uid: int, gid: int, home: str, username: str, summary: str, body
     subprocess.run(
         cmd,
         preexec_fn=_demote,
-        env=_user_env(uid, username, home),
+        env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

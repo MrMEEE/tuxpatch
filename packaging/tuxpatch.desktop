@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=TuxPatch
+Comment=Notification identity for TuxPatch update messages
+Exec=/usr/bin/true
+Icon=system-software-update
+Terminal=false
+NoDisplay=true
+Categories=System;
+StartupNotify=false
