@@ -76,6 +76,9 @@ install -D -m 0644 packaging/tuxpatch.desktop \
 
 %changelog
 
+* Fri Apr 17 2026 Release Bot <release@tuxpatch> - 1.0.11-1
+- Release 1.0.11
+
 * Fri Apr 17 2026 Release Bot <release@tuxpatch> - 1.0.10-1
 - Release 1.0.10
 
