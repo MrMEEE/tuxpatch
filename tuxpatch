@@ -475,6 +475,31 @@ def _pkg_base_lower(pkg: str) -> str:
     return _pkg_base(pkg).lower()
 
 
+def run_migrate_post_install_scripts(migrate_package_names: list[str], updated_rpm_packages: list[str]) -> None:
+    """Run /usr/share/<package>/post-install.sh for migrate packages that updated."""
+    updated_bases = {_pkg_base_lower(pkg) for pkg in updated_rpm_packages}
+
+    for package_name in migrate_package_names:
+        pkg = str(package_name).strip()
+        if not pkg:
+            continue
+        if pkg.lower() not in updated_bases:
+            continue
+
+        script = Path(f"/usr/share/{pkg}/post-install.sh")
+        if not script.exists():
+            print(f"Warning: migrate hook not found for {pkg}: {script}", file=sys.stderr)
+            continue
+
+        print(f"Running migrate hook for {pkg}: {script}")
+        r = subprocess.run([str(script)], text=True)
+        if r.returncode != 0:
+            print(
+                f"Warning: migrate hook failed for {pkg} (exit {r.returncode})",
+                file=sys.stderr,
+            )
+
+
 def kernel_or_shim_will_update(rpm_updates: list) -> bool:
     for pkg in rpm_updates:
         base = _pkg_base(pkg)
@@ -981,7 +1006,8 @@ def do_reseal():
 
 def cmd_update(config: dict):
     notif = config.get("notifications", DEFAULTS["notifications"])
-    migrate_pkgs = {p.lower() for p in notif.get("migrate_packages", ["tuxmigrate"])}
+    migrate_package_names = [str(p).strip() for p in notif.get("migrate_packages", ["tuxmigrate"]) if str(p).strip()]
+    migrate_pkgs = {p.lower() for p in migrate_package_names}
 
     # ── 1. Connectivity ───────────────────────────────────────────────────────
     print("Checking connectivity...")
@@ -1039,6 +1065,11 @@ def cmd_update(config: dict):
     rpm_did_update = update_system()
     if not rpm_did_update:
         print("Warning: dnf upgrade reported a non-zero exit code.", file=sys.stderr)
+
+    # Run migration hooks only for configured packages that were part of
+    # this update cycle, before sending the migrate notification.
+    if rpm_did_update and rpm_updates:
+        run_migrate_post_install_scripts(migrate_package_names, rpm_updates)
 
     # ── 7. RPM notifications ──────────────────────────────────────────────────
     if rpm_did_update and rpm_updates and users:

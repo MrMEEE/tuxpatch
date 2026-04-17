@@ -101,6 +101,9 @@ tpm_reseal:
 notifications:
   # RPM package names whose update triggers the "system configuration" notice.
   # Add any packages here that apply site-specific configuration.
+  # If one of these packages is updated in a tuxpatch run, tuxpatch executes
+  # /usr/share/<packagename>/post-install.sh after dnf upgrade and before
+  # sending msg_migrate_updated notifications.
   migrate_packages:
     - tuxmigrate
 
