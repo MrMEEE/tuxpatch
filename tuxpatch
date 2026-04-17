@@ -1045,7 +1045,7 @@ def do_reseal():
 
 
 def cmd_update(config: dict):
-    notif = config.get("notifications", DEFAULTS["notifications"])
+    notif = config.get("notifications") or DEFAULTS["notifications"]
     migrate_package_names = [str(p).strip() for p in notif.get("migrate_packages", ["tuxmigrate"]) if str(p).strip()]
     migrate_pkgs = {p.lower() for p in migrate_package_names}
 
