@@ -14,7 +14,6 @@ Source0:        %{name}-%{version}.tar.gz
 BuildArch:      noarch
 
 BuildRequires:  python3
-BuildRequires:  systemd-rpm-macros
 
 # Runtime
 Requires:       python3
@@ -83,7 +82,6 @@ install -D -m 0644 packaging/tuxpatch-reseal.service \
 %{_unitdir}/tuxpatch-reseal.service
 
 %post
-%systemd_post tuxpatch-reseal.service
 # Enable on fresh install. The ConditionPathExists guard in the unit means it
 # is a no-op at boot unless tuxpatch has armed it by creating the state file.
 if [ $1 -eq 1 ]; then
@@ -91,10 +89,16 @@ if [ $1 -eq 1 ]; then
 fi
 
 %preun
-%systemd_preun tuxpatch-reseal.service
+# Disable and stop the service on uninstall (not on upgrade).
+if [ $1 -eq 0 ]; then
+    systemctl disable --now tuxpatch-reseal.service >/dev/null 2>&1 || :
+fi
 
 %postun
-%systemd_postun tuxpatch-reseal.service
+# Reload systemd after uninstall so the unit is no longer known.
+if [ $1 -eq 0 ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || :
+fi
 
 %changelog
 
