@@ -1,6 +1,10 @@
 # ── Suppress debuginfo for a noarch Python script ────────────────────────────
 %global debug_package %{nil}
 
+# %{_unitdir} is provided by systemd-rpm-macros which is not available in all
+# RHEL9 build environments.  Define it here as a fallback.
+%{!?_unitdir: %global _unitdir /usr/lib/systemd/system}
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  tuxpatch
 # ─────────────────────────────────────────────────────────────────────────────
