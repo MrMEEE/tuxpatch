@@ -14,6 +14,7 @@ Source0:        %{name}-%{version}.tar.gz
 BuildArch:      noarch
 
 BuildRequires:  python3
+BuildRequires:  systemd-rpm-macros
 
 # Runtime
 Requires:       python3
@@ -31,13 +32,15 @@ Recommends:     clevis-luks
 tuxpatch is a RHEL workstation patch manager that automates:
 
  * DNF system upgrades (dnf upgrade --refresh)
- * Per-user and system-wide Flatpak updates
- * Automatic TPM2/LUKS reseal after kernel or shim updates
+ * Per-user and system-wide Flatpak updates (configurable)
+ * Desktop notifications for users via D-Bus (configurable)
+ * Automatic TPM2/LUKS reseal after RPM updates
 
-When a kernel or shim update is detected, tuxpatch builds a temporary
-initrd that embeds the LUKS passphrase, creates a one-shot systemd
-reseal service, then reboots into that initrd to rebind Clevis/TPM2
-slots with the new PCR values before returning to normal boot.
+The TPM2/LUKS reseal uses a two-boot strategy: before updating, all
+Clevis bindings are relaxed to TPM-only (no PCR check) so the first
+post-update boot succeeds even if PCR values changed.  A one-shot
+systemd service (tuxpatch-reseal.service) then rebinds Clevis against
+the fresh PCR measurements and reboots, restoring full PCR protection.
 
 %prep
 %autosetup -n %{name}-%{version}
@@ -65,6 +68,10 @@ install -D -m 0644 packaging/tuxpatch.cron \
 install -D -m 0644 packaging/tuxpatch.desktop \
     %{buildroot}%{_datadir}/applications/tuxpatch.desktop
 
+# ── Systemd service (installed but not enabled by default) ─────────────────
+install -D -m 0644 packaging/tuxpatch-reseal.service \
+    %{buildroot}%{_unitdir}/tuxpatch-reseal.service
+
 %files
 %license LICENSE
 %{_bindir}/tuxpatch
@@ -73,6 +80,21 @@ install -D -m 0644 packaging/tuxpatch.desktop \
 %dir %attr(0700, root, root) %{_sharedstatedir}/tuxpatch
 %config(noreplace) %{_sysconfdir}/cron.d/tuxpatch
 %{_datadir}/applications/tuxpatch.desktop
+%{_unitdir}/tuxpatch-reseal.service
+
+%post
+%systemd_post tuxpatch-reseal.service
+# Enable on fresh install. The ConditionPathExists guard in the unit means it
+# is a no-op at boot unless tuxpatch has armed it by creating the state file.
+if [ $1 -eq 1 ]; then
+    systemctl enable tuxpatch-reseal.service >/dev/null 2>&1 || :
+fi
+
+%preun
+%systemd_preun tuxpatch-reseal.service
+
+%postun
+%systemd_postun tuxpatch-reseal.service
 
 %changelog
 

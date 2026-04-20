@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """
 tuxpatch - RHEL workstation patch manager with TPM2/LUKS reseal support
+
+TPM2/LUKS reseal strategy (clevis, two-boot):
+  Pre-update  : Switch all clevis bindings from PCR-protected to TPM-only
+                (no PCR restrictions).  The disk will still unlock on the
+                next boot via the TPM — no password needed.
+  Post-update : A one-shot systemd service runs early in the *next* boot,
+                rebinds clevis against the fresh PCR measurements produced
+                by the new shim/kernel, then reboots one final time so the
+                system boots normally with full PCR protection restored.
 """
 
 import json
@@ -24,10 +33,9 @@ LOCKFILE   = "/var/run/tuxpatch.pid"
 STATE_DIR  = "/var/lib/tuxpatch"
 RESEAL_PENDING_FILE = f"{STATE_DIR}/reseal.pending"
 RESEAL_SERVICE_NAME = "tuxpatch-reseal.service"
-RESEAL_SERVICE_PATH = f"/etc/systemd/system/{RESEAL_SERVICE_NAME}"
-TEMP_BLS_ENTRY = "/boot/loader/entries/tuxpatch-reseal.conf"
 
-# Package prefixes that trigger a reseal when updated
+# Package prefixes that are known to change PCR7 measurements — used only
+# for informational display in 'tuxpatch status'.
 RESEAL_TRIGGERS = (
     "kernel",
     "kernel-core",
@@ -51,18 +59,21 @@ DEFAULTS = {
         "sssd_groups": [],
     },
     "flatpak": {
+        "enabled": True,
         "flat_manager_checkin": True,
     },
     "tpm_reseal": {
-        "enabled": True,
+        "enabled": False,
         "luks_password_file": "/etc/tuxpatch/luks.key",
         "pcr_ids": [7],
+        "reseal_on_trigger_only": False,
     },
     "logging": {
         "path": "/var/log/tuxpatch.log",
         "reset_on_run": True,
     },
     "notifications": {
+        "enabled": True,
         # Package names whose update triggers the migrate notification.
         "migrate_packages": ["tuxmigrate"],
         # Message templates — use {packages} for a newline-separated list.
@@ -554,24 +565,6 @@ def update_system() -> bool:
     return r.returncode == 0
 
 
-def get_default_kernel_version() -> str | None:
-    """Return the kernel version string that grubby would boot by default."""
-    r = subprocess.run(
-        ["grubby", "--default-kernel"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
-    if r.returncode != 0 or not r.stdout.strip():
-        return None
-    # /boot/vmlinuz-6.1.5-200.el9.x86_64  →  6.1.5-200.el9.x86_64
-    kernel_path = r.stdout.strip()
-    name = Path(kernel_path).name
-    if name.startswith("vmlinuz-"):
-        return name[len("vmlinuz-"):]
-    return None
-
-
 # ── LUKS / Clevis / TPM2 ─────────────────────────────────────────────────────
 
 
@@ -620,10 +613,6 @@ def _pcr_ids_str(config: dict) -> str:
     return ",".join(str(p) for p in config["tpm_reseal"].get("pcr_ids", [7]))
 
 
-def _temp_initrd_path(kernel_version: str) -> str:
-    return f"/boot/initramfs-{kernel_version}-tuxpatch-reseal.img"
-
-
 def _check_key_file(path: str):
     p = Path(path)
     if not p.exists():
@@ -638,182 +627,91 @@ def _check_key_file(path: str):
         print(f"Warning: {path} is not owned by root.", file=sys.stderr)
 
 
-def build_temp_initrd(config: dict, kernel_version: str) -> str:
+def unseal_for_update(config: dict) -> bool:
     """
-    Build a temporary initrd that embeds the LUKS key and omits clevis.
-    Returns the path to the created initrd image.
-    The key is included so dracut's crypt module can use rd.luks.key to
-    unlock LUKS without relying on clevis/TPM (which would fail after a
-    shim/kernel update changes PCR values).
+    Pre-update step: switch all clevis/TPM2 bindings from PCR-protected to
+    TPM-only (no PCR restrictions).
+
+    This ensures the next boot succeeds even if the update changes PCR7
+    measurements (new shim, GRUB, kernel).  The disk is still protected by
+    the TPM — it just won't verify boot-chain integrity until the reseal
+    service restores PCR binding on the following boot.
+
+    Returns True when all devices were switched successfully.
     """
     luks_key = config["tpm_reseal"]["luks_password_file"]
-    _check_key_file(luks_key)
+    try:
+        _check_key_file(luks_key)
+    except FileNotFoundError as e:
+        print(f"TPM reseal: {e}", file=sys.stderr)
+        return False
 
-    temp_initrd = _temp_initrd_path(kernel_version)
-    print(f"Building temporary initrd: {temp_initrd}")
+    devices = get_luks_devices_from_crypttab()
+    if not devices:
+        print("TPM reseal: no LUKS devices found in /etc/crypttab — skipping.", file=sys.stderr)
+        return False
 
-    cmd = [
-        "dracut",
-        "--force",
-        "--omit", "clevis",
-        "--include", luks_key, "/etc/tuxpatch-luks.key",
-        temp_initrd,
-        kernel_version,
-    ]
-    r = subprocess.run(cmd, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(f"dracut failed (exit {r.returncode})")
+    # Bind with TPM only, no PCR restrictions: hash+key parameters keep the
+    # binding format consistent with the PCR-bound rebind that follows later.
+    tpm_no_pcr = json.dumps({"hash": "sha256", "key": "ecc"})
+    all_ok = True
 
-    # Restrict permissions — the initrd contains the embedded key
-    Path(temp_initrd).chmod(0o600)
-    return temp_initrd
+    for mapper_name, device in devices:
+        try:
+            real_device = str(Path(device).resolve())
+        except Exception:
+            real_device = device
 
-
-def _get_kernel_cmdline(kernel_version: str) -> str:
-    """Get kernel cmdline from the existing BLS/grubby entry."""
-    entries_dir = Path("/boot/loader/entries")
-    if entries_dir.exists():
-        for entry in sorted(entries_dir.glob("*.conf")):
-            text = entry.read_text()
-            has_kernel = any(
-                kernel_version in ln
-                for ln in text.splitlines()
-                if ln.startswith("linux ")
-            )
-            if has_kernel:
-                for ln in text.splitlines():
-                    if ln.startswith("options "):
-                        return ln[len("options "):].strip()
-
-    # Fallback: grubby
-    r = subprocess.run(
-        ["grubby", "--info", f"/boot/vmlinuz-{kernel_version}"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
-    for ln in r.stdout.splitlines():
-        if ln.startswith("args="):
-            return ln[5:].strip('"').strip("'")
-    return "ro"
-
-
-def create_temp_bls_entry(kernel_version: str, temp_initrd_path: str):
-    """Create a temporary BLS boot entry that boots using the key-embedded initrd."""
-    options = _get_kernel_cmdline(kernel_version)
-
-    # Strip any existing clevis/luks.key options to avoid conflicts
-    clean_opts = [
-        o for o in options.split()
-        if not o.startswith("rd.clevis")
-        and not o.startswith("rd.luks.clevis")
-        and not o.startswith("rd.luks.key")
-    ]
-    clean_opts.append("rd.luks.key=/etc/tuxpatch-luks.key")
-    final_options = " ".join(clean_opts)
-
-    machine_id = Path("/etc/machine-id").read_text().strip()
-    initrd_name = Path(temp_initrd_path).name
-
-    content = (
-        f"title TuxPatch Reseal ({kernel_version})\n"
-        f"version tuxpatch-reseal\n"
-        f"machine-id {machine_id}\n"
-        f"linux /vmlinuz-{kernel_version}\n"
-        f"initrd /{initrd_name}\n"
-        f"options {final_options}\n"
-    )
-
-    bls_path = Path(TEMP_BLS_ENTRY)
-    bls_path.parent.mkdir(parents=True, exist_ok=True)
-    bls_path.write_text(content)
-    bls_path.chmod(0o644)
-    print(f"Created temporary boot entry: {TEMP_BLS_ENTRY}")
-
-
-def _set_grub_default(entry_title: str):
-    r = subprocess.run(
-        ["grub2-set-default", entry_title],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if r.returncode != 0:
-        raise RuntimeError(
-            f"grub2-set-default failed: {r.stderr.strip()}"
-        )
-
-
-def _get_normal_bls_title(kernel_version: str) -> str | None:
-    """Return the BLS title for the normal (non-reseal) entry for this kernel."""
-    entries_dir = Path("/boot/loader/entries")
-    if not entries_dir.exists():
-        return None
-    for entry in sorted(entries_dir.glob("*.conf")):
-        if entry == Path(TEMP_BLS_ENTRY):
+        slots = get_clevis_slots(real_device)
+        if not slots:
+            print(f"  {real_device}: no clevis binding found, skipping.")
             continue
-        text = entry.read_text()
-        has_kernel = any(
-            kernel_version in ln
-            for ln in text.splitlines()
-            if ln.startswith("linux ")
+
+        print(f"  {real_device}: removing PCR binding (slots {slots}) → TPM-only...")
+
+        for slot in slots:
+            subprocess.run(
+                ["clevis", "luks", "unbind", "-d", real_device, "-s", str(slot), "-f"],
+                check=False,
+            )
+
+        r = subprocess.run(
+            ["clevis", "luks", "bind", "-d", real_device, "-k", luks_key,
+             "tpm2", tpm_no_pcr],
+            text=True,
         )
-        if has_kernel:
-            for ln in text.splitlines():
-                if ln.startswith("title "):
-                    return ln[len("title "):].strip()
-    return None
+        if r.returncode != 0:
+            print(f"  Error: clevis bind (no-PCR) failed for {real_device}", file=sys.stderr)
+            all_ok = False
+        else:
+            print(f"  {real_device}: now TPM-bound without PCR restriction.")
+
+    return all_ok
 
 
-def install_reseal_service(config: dict, kernel_version: str, normal_entry_title: str):
-    """Install the one-shot systemd service that reseals clevis on the reseal boot."""
+def install_reseal_service(config: dict) -> None:
+    """
+    Write the reseal state file and enable the pre-installed
+    tuxpatch-reseal.service so it runs on the next boot.
+    The service unit is shipped by the tuxpatch RPM and is already present
+    at RESEAL_SERVICE_PATH; we never write it ourselves.
+    """
     pcr_ids = _pcr_ids_str(config)
     luks_key = config["tpm_reseal"]["luks_password_file"]
-    tuxpatch_bin = Path(sys.argv[0]).resolve()
-
-    service_content = f"""\
-[Unit]
-Description=TuxPatch TPM2 Reseal After Kernel/Shim Update
-After=local-fs.target sysinit.target
-Before=network.target graphical.target
-ConditionPathExists={RESEAL_PENDING_FILE}
-DefaultDependencies=no
-
-[Service]
-Type=oneshot
-RemainAfterExit=no
-ExecStart={tuxpatch_bin} --do-reseal
-# Connect to tty1 so notifications are visible on the physical console
-# and the failure prompt can accept keyboard input.
-TTYPath=/dev/tty1
-StandardInput=tty
-StandardOutput=journal+console
-StandardError=journal+console
-TTYReset=no
-TTYVHangup=no
-TimeoutStartSec=300
-
-[Install]
-WantedBy=sysinit.target
-"""
-
-    Path(RESEAL_SERVICE_PATH).write_text(service_content)
 
     Path(STATE_DIR).mkdir(parents=True, exist_ok=True)
     state = {
-        "kernel_version": kernel_version,
         "pcr_ids": pcr_ids,
         "luks_password_file": luks_key,
-        "normal_entry_title": normal_entry_title or "",
     }
     with open(RESEAL_PENDING_FILE, "w") as f:
         for k, v in state.items():
             f.write(f"{k}={v}\n")
     Path(RESEAL_PENDING_FILE).chmod(0o600)
 
-    subprocess.run(["systemctl", "daemon-reload"], check=True)
     subprocess.run(["systemctl", "enable", RESEAL_SERVICE_NAME], check=True)
-    print(f"Installed and enabled {RESEAL_SERVICE_NAME}")
+    print(f"Enabled {RESEAL_SERVICE_NAME}")
+
 
 
 # ── Boot-time UI helpers ─────────────────────────────────────────────────────
@@ -915,42 +813,64 @@ def _read_state_file() -> dict:
 
 def do_reseal():
     """
-    Internal command invoked by the reseal systemd service on first boot
-    after a kernel/shim update. Performs:
-      1. Unbind + rebind all clevis slots with current PCR values
-      2. Rebuild the normal initrd
-      3. Clean up temp initrd, BLS entry, service, state file
-      4. Restore grub default to normal entry
-      5. Reboot
+    Internal command invoked by the reseal systemd service on the first boot
+    after an RPM update.  At this point the system has booted normally — the
+    LUKS volume was unlocked by the TPM without PCR verification (the
+    binding was relaxed by tuxpatch before the update).
+
+    Steps:
+      1. Rebind all clevis slots with the *current* (post-update) PCR values.
+      2. Clean up the state file and disable/remove the service.
+      3. Reboot so the system comes up with full PCR protection restored.
     """
     if not Path(RESEAL_PENDING_FILE).exists():
         print("No reseal pending.", file=sys.stderr)
         return
 
     state = _read_state_file()
-    kernel_version = state.get("kernel_version", "")
     pcr_ids = state.get("pcr_ids", "7")
     luks_key = state.get("luks_password_file", "")
-    normal_entry_title = state.get("normal_entry_title", "")
-
-    if not kernel_version:
-        _boot_error_wait("kernel_version missing from state file.")
-        sys.exit(1)
 
     if not luks_key or not Path(luks_key).exists():
         _boot_error_wait(f"LUKS key file not found: {luks_key}")
         sys.exit(1)
 
-    _boot_notify(f"=== TPM2 Reseal started (kernel {kernel_version}) ===")
+    # Hide Plymouth so the text banner is always visible on tty1
+    if _plymouth_active():
+        subprocess.run(
+            ["plymouth", "hide-splash"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
-    # ── 1. Rebind clevis on all LUKS devices ──────────────────────────────────
-    tpm_config = json.dumps({"pcr_ids": pcr_ids})
+    banner = (
+        f"\n{_CYAN}{_BOLD}"
+        f"╔══════════════════════════════════════════════════════════╗\n"
+        f"║          TuxPatch — TPM2 / LUKS Reseal in Progress       ║\n"
+        f"║                                                          ║\n"
+        f"║  PCR measurements are being re-sealed against the new    ║\n"
+        f"║  kernel / shim.  The system will reboot automatically    ║\n"
+        f"║  when finished.  DO NOT power off.                       ║\n"
+        f"╚══════════════════════════════════════════════════════════╝"
+        f"{_RESET}\n"
+    )
+    _write_tty(banner)
+    print("=== TPM2 Reseal started ===")
+    if _plymouth_active():
+        _plymouth_message("[TuxPatch] TPM2 Reseal in progress — do not power off")
+
+    # Bind with hash/key/bank consistent with what was used pre-update.
+    tpm_config = json.dumps({
+        "hash": "sha256",
+        "key": "ecc",
+        "pcr_bank": "sha256",
+        "pcr_ids": pcr_ids,
+    })
     devices = get_luks_devices_from_crypttab()
     reseal_failed = False
     failed_device = ""
 
     for mapper_name, device in devices:
-        # Resolve symlink (e.g. /dev/disk/by-uuid/...)
         try:
             real_device = str(Path(device).resolve())
         except Exception:
@@ -961,23 +881,19 @@ def do_reseal():
             _boot_notify(f"{real_device} ({mapper_name}): no clevis binding, skipping.")
             continue
 
-        _boot_notify(f"Resealing {real_device} (slots: {slots}) with PCR [{pcr_ids}]...")
+        _boot_notify(f"Resealing {real_device} (slots {slots}) with PCR [{pcr_ids}]...")
 
-        # Unbind all existing clevis slots
+        # Remove the no-PCR bindings installed before the update
         for slot in slots:
             subprocess.run(
                 ["clevis", "luks", "unbind", "-d", real_device, "-s", str(slot), "-f"],
                 check=False,
             )
 
-        # Rebind using the LUKS key to authorise the new binding
+        # Rebind with the current PCR measurements
         r = subprocess.run(
-            [
-                "clevis", "luks", "bind",
-                "-d", real_device,
-                "-k", luks_key,
-                "tpm2", tpm_config,
-            ],
+            ["clevis", "luks", "bind", "-d", real_device, "-k", luks_key,
+             "tpm2", tpm_config],
             text=True,
         )
         if r.returncode != 0:
@@ -985,59 +901,18 @@ def do_reseal():
             failed_device = real_device
 
     if reseal_failed:
-        # Leave temp initrd and BLS entry in place so the next boot also uses
-        # the key-embedded initrd and the service retries.
+        # Leave the state file in place so the service retries on the next boot.
         _boot_error_wait(f"clevis bind failed for {failed_device}")
         sys.exit(1)
 
     _boot_notify("All devices resealed successfully.")
 
-    # ── 2. Rebuild the normal initrd ──────────────────────────────────────────
-    normal_initrd = f"/boot/initramfs-{kernel_version}.img"
-    _boot_notify(f"Rebuilding normal initrd: {normal_initrd}")
-    r = subprocess.run(
-        ["dracut", "--force", normal_initrd, kernel_version],
-        text=True,
-    )
-    if r.returncode != 0:
-        print(
-            "Warning: dracut failed to rebuild normal initrd. "
-            "You may need to run it manually.",
-            file=sys.stderr,
-        )
-
-    # ── 3. Cleanup ────────────────────────────────────────────────────────────
-    temp_initrd = _temp_initrd_path(kernel_version)
-    if Path(temp_initrd).exists():
-        Path(temp_initrd).unlink()
-        _boot_notify(f"Removed temporary initrd: {temp_initrd}")
-
-    if Path(TEMP_BLS_ENTRY).exists():
-        Path(TEMP_BLS_ENTRY).unlink()
-        _boot_notify(f"Removed temporary BLS entry: {TEMP_BLS_ENTRY}")
-
+    # ── Cleanup ───────────────────────────────────────────────────────────────
+    # Disable the service (the unit file is RPM-managed, never deleted).
     subprocess.run(["systemctl", "disable", RESEAL_SERVICE_NAME], check=False)
-    if Path(RESEAL_SERVICE_PATH).exists():
-        Path(RESEAL_SERVICE_PATH).unlink()
-    subprocess.run(["systemctl", "daemon-reload"], check=False)
-
     Path(RESEAL_PENDING_FILE).unlink(missing_ok=True)
 
-    # ── 4. Restore grub default ───────────────────────────────────────────────
-    if normal_entry_title:
-        try:
-            _set_grub_default(normal_entry_title)
-            _boot_notify(f"Restored grub default to: {normal_entry_title!r}")
-        except RuntimeError as e:
-            print(f"Warning: could not restore grub default: {e}", file=sys.stderr)
-    else:
-        # Fall back: set default to the new kernel by path
-        subprocess.run(
-            ["grubby", "--set-default", f"/boot/vmlinuz-{kernel_version}"],
-            check=False,
-        )
-
-    _boot_notify("Reseal complete. Rebooting...")
+    _boot_notify("Reseal complete — rebooting into fully protected system.")
     subprocess.run(["systemctl", "reboot"])
 
 
@@ -1046,8 +921,10 @@ def do_reseal():
 
 def cmd_update(config: dict):
     notif = config.get("notifications") or DEFAULTS["notifications"]
+    notif_enabled = notif.get("enabled", True)
     migrate_package_names = [str(p).strip() for p in notif.get("migrate_packages", ["tuxmigrate"]) if str(p).strip()]
     migrate_pkgs = {p.lower() for p in migrate_package_names}
+    flatpak_enabled = config["flatpak"].get("enabled", True)
 
     # ── 1. Connectivity ───────────────────────────────────────────────────────
     print("Checking connectivity...")
@@ -1058,10 +935,17 @@ def cmd_update(config: dict):
     # ── 2. Pre-update: check which packages would be updated ─────────────────
     print("Checking pending updates...")
     rpm_updates = get_rpm_updates()
-    needs_reseal = (
-        config["tpm_reseal"]["enabled"]
-        and kernel_or_shim_will_update(rpm_updates)
-    )
+    reseal_enabled = config["tpm_reseal"]["enabled"]
+    reseal_on_trigger_only = config["tpm_reseal"].get("reseal_on_trigger_only", False)
+
+    if reseal_enabled:
+        if reseal_on_trigger_only:
+            needs_reseal = kernel_or_shim_will_update(rpm_updates)
+        else:
+            needs_reseal = bool(rpm_updates)
+    else:
+        needs_reseal = False
+
     kernel_will_update = any(
         _pkg_base_lower(p).startswith("kernel") for p in rpm_updates
     )
@@ -1069,50 +953,61 @@ def cmd_update(config: dict):
         _pkg_base_lower(p) in migrate_pkgs for p in rpm_updates
     )
 
-    # ── 3. Update per-user flatpaks ───────────────────────────────────────────
+    # ── 3. Pre-update TPM reseal: relax PCR binding ───────────────────────────
+    # Done BEFORE the update so the next boot succeeds even if the update
+    # changes PCR7 measurements (shim, GRUB, kernel).
+    if needs_reseal:
+        print("\nTPM reseal enabled — removing PCR binding before update:")
+        if not unseal_for_update(config):
+            print(
+                "Warning: failed to remove PCR binding. "
+                "Reseal will be skipped to avoid locking the system.",
+                file=sys.stderr,
+            )
+            needs_reseal = False
+
+    # ── 4. Update per-user flatpaks ───────────────────────────────────────────
     users = {}
-    if _flatpak_available():
+    if flatpak_enabled and _flatpak_available():
         users = get_users_to_update(config)
         if users:
             print(f"Updating user flatpaks for {len(users)} user(s)...")
             for username, (uid, gid, home) in users.items():
                 print(f"  [{username}] flatpak --user update")
-                # Snapshot which updates are pending before and after so we
-                # know exactly what was installed to put in the notification.
                 before = set(get_user_flatpak_updates(uid, gid, username, home))
                 update_user_flatpaks(uid, gid, username, home)
                 after = set(get_user_flatpak_updates(uid, gid, username, home))
                 updated = before - after
-                if updated:
+                if updated and notif_enabled:
                     pkg_list = "\n".join(sorted(updated))
                     msg = notif["msg_flatpak_updated"].format(packages=pkg_list)
                     notify_user(uid, gid, home, username, "TuxPatch", msg)
         else:
             print("No applicable users found for flatpak updates.")
 
-        # ── 4. Update system flatpaks ─────────────────────────────────────────
+        # ── 5. Update system flatpaks ─────────────────────────────────────────
         print("Updating system flatpaks...")
         update_system_flatpaks()
 
-        # ── 5. flat-manager-checkin ───────────────────────────────────────────
+        # ── 6. flat-manager-checkin ───────────────────────────────────────────
         if config["flatpak"].get("flat_manager_checkin", True):
             run_flat_manager_checkin()
+    elif not flatpak_enabled:
+        print("Flatpak updates disabled in config, skipping.")
     else:
         print("flatpak not found, skipping flatpak updates.")
 
-    # ── 6. Update system packages ─────────────────────────────────────────────
+    # ── 7. Update system packages ─────────────────────────────────────────────
     print("Updating system packages (dnf upgrade)...")
     rpm_did_update = update_system()
     if not rpm_did_update:
         print("Warning: dnf upgrade reported a non-zero exit code.", file=sys.stderr)
 
-    # Run migration hooks only for configured packages that were part of
-    # this update cycle, before sending the migrate notification.
     if rpm_did_update and rpm_updates:
         run_migrate_post_install_scripts(migrate_package_names, rpm_updates)
 
-    # ── 7. RPM notifications ──────────────────────────────────────────────────
-    if rpm_did_update and rpm_updates and users:
+    # ── 8. RPM notifications ──────────────────────────────────────────────────
+    if notif_enabled and rpm_did_update and rpm_updates and users:
         if kernel_will_update:
             notify_all_users(users, "TuxPatch", notif["msg_kernel_updated"])
         if migrate_will_update:
@@ -1120,45 +1015,34 @@ def cmd_update(config: dict):
         if not kernel_will_update and not migrate_will_update:
             notify_all_users(users, "TuxPatch", notif["msg_rpm_updated"])
 
-    # ── 7. TPM reseal setup (if needed) ──────────────────────────────────────
-    if needs_reseal:
-        print("\nKernel or shim will be updated — preparing TPM2 reseal.")
-        kernel_version = get_default_kernel_version()
-        if not kernel_version:
+    # ── 9. TPM reseal: install service and reboot ─────────────────────────────
+    if needs_reseal and rpm_did_update:
+        print("\nPCR binding relaxed. Installing reseal service and rebooting...")
+        try:
+            install_reseal_service(config)
+        except Exception as e:
+            print(f"Error: could not install reseal service: {e}", file=sys.stderr)
             print(
-                "Warning: could not determine new kernel version from grubby. "
-                "TPM reseal will not be configured.",
+                "Warning: PCR binding has been removed but the reseal service "
+                "could not be installed. Run 'tuxpatch --do-reseal' manually "
+                "after the next boot.",
                 file=sys.stderr,
             )
             return
-
-        print(f"New default kernel: {kernel_version}")
-
-        # Build temporary initrd embedding the LUKS key
-        try:
-            temp_initrd = build_temp_initrd(config, kernel_version)
-        except (FileNotFoundError, RuntimeError) as e:
-            print(f"Error building temp initrd: {e}", file=sys.stderr)
-            return
-
-        # Record normal BLS title before we change the default
-        normal_title = _get_normal_bls_title(kernel_version)
-
-        # Create temporary BLS boot entry
-        create_temp_bls_entry(kernel_version, temp_initrd)
-
-        # Set the reseal entry as the persistent grub default so that
-        # repeated reboots keep retrying until reseal succeeds
-        try:
-            _set_grub_default(f"TuxPatch Reseal ({kernel_version})")
-        except RuntimeError as e:
-            print(f"Warning: {e}", file=sys.stderr)
-
-        # Install the one-shot reseal service
-        install_reseal_service(config, kernel_version, normal_title or "")
-
-        print("Rebooting to perform TPM reseal...")
         subprocess.run(["systemctl", "reboot"])
+    elif needs_reseal and not rpm_did_update:
+        # Update failed after we already relaxed the PCR binding.
+        # Install the service anyway so the reseal runs on the next boot
+        # and PCR protection is restored.
+        print(
+            "\nWarning: RPM update failed but PCR binding was already relaxed. "
+            "Installing reseal service so protection is restored on next boot.",
+            file=sys.stderr,
+        )
+        try:
+            install_reseal_service(config)
+        except Exception as e:
+            print(f"Error: could not install reseal service: {e}", file=sys.stderr)
     else:
         print("\nUpdate complete.")
 
@@ -1183,21 +1067,30 @@ def cmd_status(config: dict):
 
     # ── TPM reseal ────────────────────────────────────────────────────────────
     if config["tpm_reseal"]["enabled"]:
-        reseal_triggers = [
-            p for p in rpm_updates if kernel_or_shim_will_update([p])
-        ]
-        if reseal_triggers:
-            pcr_ids = config["tpm_reseal"].get("pcr_ids", [7])
-            print(f"\nTPM Reseal: YES (triggered by: {', '.join(reseal_triggers)})")
-            print(f"  PCR IDs : {pcr_ids}")
-            print(f"  Key file: {config['tpm_reseal']['luks_password_file']}")
+        pcr_ids = config["tpm_reseal"].get("pcr_ids", [7])
+        key_file = config["tpm_reseal"]["luks_password_file"]
+        trigger_only = config["tpm_reseal"].get("reseal_on_trigger_only", False)
+        if trigger_only:
+            reseal_triggers = [p for p in rpm_updates if kernel_or_shim_will_update([p])]
+            trigger_desc = f"trigger packages only ({', '.join(reseal_triggers) if reseal_triggers else 'none pending'})"
+            will_reseal = bool(reseal_triggers)
         else:
-            print("\nTPM Reseal: No (no kernel/shim updates pending)")
+            trigger_desc = "any RPM update"
+            will_reseal = bool(rpm_updates)
+        print(f"\nTPM Reseal: enabled (mode: {trigger_desc})")
+        print(f"  PCR IDs : {pcr_ids}")
+        print(f"  Key file: {key_file}")
+        if will_reseal:
+            print(f"  Action  : will unseal → update → reseal on next boot")
+        else:
+            print(f"  Action  : no qualifying updates pending, no reseal needed")
     else:
         print("\nTPM Reseal: Disabled in config")
 
     # ── System flatpak updates ────────────────────────────────────────────────
-    if _flatpak_available():
+    if not config["flatpak"].get("enabled", True):
+        print("\nFlatpak updates: Disabled in config")
+    elif _flatpak_available():
         print("\nPending system flatpak updates:")
         sys_updates = get_system_flatpak_updates()
         if sys_updates:
@@ -1221,7 +1114,6 @@ def cmd_status(config: dict):
             print("  (none)")
     else:
         print("\nflatpak not installed — skipping flatpak status.")
-
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 

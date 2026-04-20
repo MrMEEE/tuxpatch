@@ -1,0 +1,47 @@
+#
+# tuxpatch-reseal.service
+#
+# One-shot service installed by 'tuxpatch update' before rebooting after an
+# RPM update.  On the first boot after the update it:
+#
+#   1. Rebinds all clevis/TPM2 LUKS slots against the fresh (post-update)
+#      PCR measurements, using the passphrase from luks_password_file to
+#      authorise the key-slot change.
+#   2. Disables and removes itself.
+#   3. Reboots so the system comes up with full PCR protection restored.
+#
+# This service is not enabled or installed by the tuxpatch RPM itself —
+# it is written to /etc/systemd/system/ and enabled at run-time by
+# 'tuxpatch update' whenever a reseal is needed.  The file shipped here
+# serves as a reference template and is included in the RPM only for
+# documentation / packaging completeness.
+#
+# See: /usr/bin/tuxpatch --do-reseal
+#
+
+[Unit]
+Description=TuxPatch TPM2 Reseal After System Update
+After=local-fs.target sysinit.target
+Before=network.target display-manager.service graphical.target
+# Prevent the graphical environment from starting while we are resealing.
+Conflicts=display-manager.service graphical.target
+# Guard: only run when tuxpatch placed a pending-state file here.
+ConditionPathExists=/var/lib/tuxpatch/reseal.pending
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=/usr/bin/tuxpatch --do-reseal
+# Connect to tty1 so messages are visible on the physical console and the
+# failure prompt can accept keyboard input when the graphical stack is down.
+TTYPath=/dev/tty1
+StandardInput=tty
+StandardOutput=journal+console
+StandardError=journal+console
+TTYReset=no
+TTYVHangup=no
+TimeoutStartSec=300
+
+[Install]
+WantedBy=sysinit.target
