@@ -12,11 +12,13 @@ TPM2/LUKS reseal strategy (clevis, two-boot):
                 system boots normally with full PCR protection restored.
 """
 
+import atexit
 import json
 import os
 import socket
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -726,6 +728,53 @@ def _pcr_ids_str(config: dict) -> str:
     return ",".join(str(p) for p in config["tpm_reseal"].get("pcr_ids", [7]))
 
 
+_warned_key_files: set = set()
+_temp_key_files: list = []
+
+
+@atexit.register
+def _cleanup_temp_keys():
+    """Remove any stripped key copies written to /dev/shm at process exit."""
+    for tmp in _temp_key_files:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _resolve_key_file(path: str) -> str:
+    """Return the path to pass to --key-file / -k.
+
+    If the file ends with a newline (a common mistake when the file was
+    created with a text editor or echo), a stripped copy is written to
+    /dev/shm (memory-backed, never written to disk) and that path is
+    returned instead.  The warning is printed only once per path per run.
+    The temp file is removed automatically at process exit.
+    """
+    data = Path(path).read_bytes()
+    if not data.endswith(b'\n'):
+        return path
+    if path not in _warned_key_files:
+        _warned_key_files.add(path)
+        print(
+            f"Warning: {path!r} ends with a newline — stripping it for LUKS operations.\n"
+            f"  Fix permanently: truncate -s -1 {path}",
+            file=sys.stderr,
+        )
+    shm = Path('/dev/shm')
+    fd, tmp = tempfile.mkstemp(
+        prefix='.tuxpatch-key-',
+        dir=str(shm) if shm.exists() else None,
+    )
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, data.rstrip(b'\n'))
+    finally:
+        os.close(fd)
+    _temp_key_files.append(tmp)
+    return tmp
+
+
 def _check_key_file(path: str):
     p = Path(path)
     if not p.exists():
@@ -738,12 +787,19 @@ def _check_key_file(path: str):
         )
     if stat.st_uid != 0:
         print(f"Warning: {path} is not owned by root.", file=sys.stderr)
+    if p.read_bytes().endswith(b'\n'):
+        _warned_key_files.add(path)
+        print(
+            f"Warning: {path!r} ends with a newline — it will be stripped automatically.\n"
+            f"  Fix permanently: truncate -s -1 {path}",
+            file=sys.stderr,
+        )
 
 
 def _verify_key_unlocks(device: str, key_file: str) -> bool:
     """Return True if key_file can unlock the LUKS device."""
     r = subprocess.run(
-        ["cryptsetup", "--key-file", key_file, "open",
+        ["cryptsetup", "--key-file", _resolve_key_file(key_file), "open",
          "--test-passphrase", device],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -769,6 +825,7 @@ def unseal_for_update(config: dict) -> bool:
     except FileNotFoundError as e:
         print(f"TPM reseal: {e}", file=sys.stderr)
         return False
+    luks_key = _resolve_key_file(luks_key)
 
     devices = get_luks_devices_from_crypttab()
     if not devices:
@@ -813,6 +870,7 @@ def unseal_for_update(config: dict) -> bool:
             r = subprocess.run(
                 ["clevis", "luks", "bind", "-d", real_device, "-k", luks_key,
                  "tpm2", clevis_no_pcr],
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -940,7 +998,7 @@ def _boot_notify(message: str):
     _write_tty(f"\n{_CYAN}{_BOLD}[TuxPatch]{_RESET} {message}\n")
 
 
-def _boot_error_wait(message: str):
+def _boot_error_wait(message: str, reboot: bool = True):
     """
     Show an error during the reseal boot, hide Plymouth so the user can
     see the TTY, wait for Enter, then reboot.
@@ -956,23 +1014,24 @@ def _boot_error_wait(message: str):
             stderr=subprocess.DEVNULL,
         )
 
-    _write_tty(
-        f"\n{_RED}{_BOLD}╔══ TuxPatch Reseal FAILED ══════════════════════════════╗{_RESET}\n"
-        f"{_RED}{_BOLD}║{_RESET} {message:<54}{_RED}{_BOLD}║{_RESET}\n"
-        f"{_RED}{_BOLD}╚════════════════════════════════════════════════════════╝{_RESET}\n"
-        f"\n{_YELLOW}The temporary initrd and boot entry have been kept.\n"
-        f"The system will try again on the next boot.{_RESET}\n"
-        f"\n{_BOLD}Press Enter to reboot and try again...{_RESET} ",
-    )
+    if reboot:
+        _write_tty(
+            f"\n{_RED}{_BOLD}╔══ TuxPatch Reseal FAILED ══════════════════════════════╗{_RESET}\n"
+            f"{_RED}{_BOLD}║{_RESET} {message:<54}{_RED}{_BOLD}║{_RESET}\n"
+            f"{_RED}{_BOLD}╚════════════════════════════════════════════════════════╝{_RESET}\n"
+            f"\n{_YELLOW}The temporary initrd and boot entry have been kept.\n"
+            f"The system will try again on the next boot.{_RESET}\n"
+            f"\n{_BOLD}Press Enter to reboot and try again...{_RESET} ",
+        )
 
-    # stdin is /dev/tty1 when the service runs with StandardInput=tty
-    try:
-        sys.stdin.readline()
-    except Exception:
-        import time
-        time.sleep(30)
+        # stdin is /dev/tty1 when the service runs with StandardInput=tty
+        try:
+            sys.stdin.readline()
+        except Exception:
+            import time
+            time.sleep(30)
 
-    subprocess.run(["systemctl", "reboot"])
+        subprocess.run(["systemctl", "reboot"])
 
 
 def _read_state_file() -> dict:
@@ -1014,9 +1073,11 @@ def do_reseal(luks_key: str = None, pcr_ids: str = None, reboot: bool = True,
     if not luks_key or not Path(luks_key).exists():
         _boot_error_wait(
             f"LUKS key file not found: {luks_key!r}\n"
-            "Set tpm_reseal.luks_password_file in the config."
+            "Set tpm_reseal.luks_password_file in the config.",
+            reboot=reboot,
         )
         sys.exit(1)
+    luks_key = _resolve_key_file(luks_key)
 
     # Hide Plymouth so the text banner is always visible on tty1
     if _plymouth_active():
@@ -1061,6 +1122,17 @@ def do_reseal(luks_key: str = None, pcr_ids: str = None, reboot: bool = True,
 
         backend, slots = _detect_tpm2_backend(device, real_device, preferred_backend)
 
+        # Verify the key file actually unlocks this device before attempting to bind.
+        if not _verify_key_unlocks(real_device, luks_key):
+            _boot_notify(
+                f"Error: {luks_key!r} does not unlock {real_device}. "
+                f"Add it as a LUKS keyslot: "
+                f"cryptsetup luksAddKey {real_device} {luks_key}"
+            )
+            reseal_failed = True
+            failed_device = real_device
+            continue
+
         if slots:
             _boot_notify(f"Resealing {real_device} ({backend}, slots {slots}) with PCR [{pcr_ids}]...")
         else:
@@ -1072,6 +1144,7 @@ def do_reseal(luks_key: str = None, pcr_ids: str = None, reboot: bool = True,
             r = subprocess.run(
                 ["clevis", "luks", "bind", "-d", real_device, "-k", luks_key,
                  "tpm2", clevis_tpm_config],
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -1118,7 +1191,7 @@ def do_reseal(luks_key: str = None, pcr_ids: str = None, reboot: bool = True,
 
     if reseal_failed:
         # Leave the state file in place so the service retries on the next boot.
-        _boot_error_wait(f"TPM2 reseal failed for {failed_device}")
+        _boot_error_wait(f"TPM2 reseal failed for {failed_device}", reboot=reboot)
         sys.exit(1)
 
     _boot_notify("All devices resealed successfully.")
@@ -1425,6 +1498,7 @@ def cmd_pcr_remove(config: dict, device_filter: str | None, slot_filter: int | N
             f"Error: LUKS key file not found: {luks_key!r}\n"
             f"Set tpm_reseal.luks_password_file in {CONFIG_PATH}"
         )
+    luks_key = _resolve_key_file(luks_key)
 
     # Verify the key file against each device before touching any slots
     # (checked per-device below, but do an early inventory pass here).
