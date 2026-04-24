@@ -1413,9 +1413,9 @@ def cmd_update(config: dict):
         msg_fw = notif.get("msg_firmware_updated", DEFAULTS["notifications"]["msg_firmware_updated"])
         notify_all_users(users, "TuxPatch", msg_fw)
 
-    # ── 10. TPM reseal: write state file and reboot ───────────────────────────
+    # ── 10. TPM reseal: write state file ─────────────────────────────────────
     if needs_reseal and rpm_did_update:
-        print("\nPCR binding relaxed. Writing reseal state and rebooting...")
+        print("\nPCR binding relaxed. Writing reseal state...")
         try:
             install_reseal_service(config)
         except Exception as e:
@@ -1427,7 +1427,8 @@ def cmd_update(config: dict):
                 file=sys.stderr,
             )
             return
-        subprocess.run(["systemctl", "reboot"])
+        print("Reseal state written — TPM2 will be resealed on the next boot.")
+        print("\nUpdate complete. Please reboot at your convenience.")
     elif needs_reseal and not rpm_did_update:
         # Update failed after we already relaxed the PCR binding.
         # Write the state file anyway so the reseal runs on next boot
@@ -1776,6 +1777,8 @@ def _usage():
         f"  pcr-status              Show current PCR values and clevis bindings\n"
         f"  pcr-remove [<device>] [<slot>]\n"
         f"                          Remove PCR restrictions from clevis binding(s)\n"
+        f"  arm-reseal              Write the reseal state file so that the TPM2\n"
+        f"                          reseal runs automatically on the next boot\n"
         f"  reseal                  Manually run the TPM2/LUKS reseal now\n"
         f"                          (same as the boot-time service; requires the\n"
         f"                          reseal.pending state file to be present)\n"
@@ -1820,6 +1823,18 @@ def main():
         except Exception as e:
             print(f"Warning: could not write reseal state file: {e}", file=sys.stderr)
         do_reseal(luks_key=luks_key, pcr_ids=pcr_ids, reboot=False, preferred_backend=preferred)
+        return
+
+    # pcr-status and pcr-remove don't touch the update lock
+    if command == "arm-reseal":
+        config = load_config()
+        if Path(RESEAL_PENDING_FILE).exists():
+            print("Reseal state already present — reseal will run on next boot.")
+        else:
+            try:
+                install_reseal_service(config)
+            except Exception as e:
+                sys.exit(f"Error: could not write reseal state: {e}")
         return
 
     # pcr-status and pcr-remove don't touch the update lock
