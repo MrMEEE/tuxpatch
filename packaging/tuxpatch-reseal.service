@@ -21,8 +21,6 @@
 Description=TuxPatch TPM2 Reseal After System Update
 After=local-fs.target sysinit.target
 Before=network.target display-manager.service graphical.target
-# Prevent the graphical environment from starting while we are resealing.
-Conflicts=display-manager.service graphical.target
 # Guard: only run when tuxpatch placed a pending-state file here.
 ConditionPathExists=/var/lib/tuxpatch/reseal.pending
 DefaultDependencies=no
@@ -31,14 +29,12 @@ DefaultDependencies=no
 Type=oneshot
 RemainAfterExit=no
 ExecStart=/usr/bin/tuxpatch --do-reseal
-# Connect to tty1 so messages are visible on the physical console and the
-# failure prompt can accept keyboard input when the graphical stack is down.
-TTYPath=/dev/tty1
-StandardInput=tty
+# Output goes to journal+console; tty5 is opened directly by the script
+# when needed (error prompts), so StandardInput=null avoids systemd spawning
+# systemd-tty-ask-password-agent which would hang the service.
+StandardInput=null
 StandardOutput=journal+console
 StandardError=journal+console
-TTYReset=no
-TTYVHangup=no
 TimeoutStartSec=300
 
 [Install]

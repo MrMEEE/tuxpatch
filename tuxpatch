@@ -876,6 +876,7 @@ def _verify_key_unlocks(device: str, key_file: str) -> bool:
     r = subprocess.run(
         ["cryptsetup", "--key-file", _resolve_key_file(key_file), "open",
          "--test-passphrase", device],
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -962,14 +963,16 @@ def unseal_for_update(config: dict) -> bool:
             for slot in slots:
                 subprocess.run(
                     ["clevis", "luks", "unbind", "-d", real_device, "-s", str(slot), "-f"],
+                    stdin=subprocess.DEVNULL,
                     check=False,
                 )
 
         else:  # cryptenroll
             # Enroll new TPM-only slot FIRST (no --tpm2-pcrs), then wipe old slots.
             r = subprocess.run(
-                ["systemd-cryptenroll", "--tpm2-device=auto",
+                ["systemd-cryptenroll", "--no-ask-password", "--tpm2-device=auto",
                  f"--unlock-key-file={luks_key}", real_device],
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -985,8 +988,9 @@ def unseal_for_update(config: dict) -> bool:
 
             for slot in slots:
                 subprocess.run(
-                    ["systemd-cryptenroll", f"--wipe-slot={slot}",
+                    ["systemd-cryptenroll", "--no-ask-password", f"--wipe-slot={slot}",
                      f"--unlock-key-file={luks_key}", real_device],
+                    stdin=subprocess.DEVNULL,
                     check=False,
                 )
 
@@ -1052,10 +1056,13 @@ def _plymouth_message(text: str):
     )
 
 
+RESEAL_TTY = "/dev/tty5"
+
+
 def _write_tty(text: str):
-    """Write directly to /dev/tty1, ignoring errors (tty may not exist)."""
+    """Write directly to the reseal TTY, ignoring errors (tty may not exist)."""
     try:
-        with open("/dev/tty1", "w") as tty:
+        with open(RESEAL_TTY, "w") as tty:
             tty.write(text)
             tty.flush()
     except Exception:
@@ -1065,7 +1072,7 @@ def _write_tty(text: str):
 def _boot_notify(message: str):
     """
     Show a status message during the reseal boot.
-    Writes to: journal (print), Plymouth splash, and /dev/tty1.
+    Writes to: journal (print), Plymouth splash, and the reseal TTY.
     """
     print(message)
     tag = f"[TuxPatch] {message}"
@@ -1086,23 +1093,28 @@ def _boot_error_wait(message: str, reboot: bool = True):
         _plymouth_message(f"[TuxPatch] ERROR: {message}")
         subprocess.run(
             ["plymouth", "hide-splash"],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
 
     if reboot:
+        # Switch the console to the reseal TTY so the user can see the message.
+        subprocess.run(["chvt", "5"], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         _write_tty(
             f"\n{_RED}{_BOLD}╔══ TuxPatch Reseal FAILED ══════════════════════════════╗{_RESET}\n"
             f"{_RED}{_BOLD}║{_RESET} {message:<54}{_RED}{_BOLD}║{_RESET}\n"
             f"{_RED}{_BOLD}╚════════════════════════════════════════════════════════╝{_RESET}\n"
-            f"\n{_YELLOW}The temporary initrd and boot entry have been kept.\n"
             f"The system will try again on the next boot.{_RESET}\n"
             f"\n{_BOLD}Press Enter to reboot and try again...{_RESET} ",
         )
 
-        # stdin is /dev/tty1 when the service runs with StandardInput=tty
+        # Read Enter directly from the reseal TTY (service runs with StandardInput=null
+        # to avoid systemd spawning systemd-tty-ask-password-agent).
         try:
-            sys.stdin.readline()
+            with open(RESEAL_TTY, "r") as _tty:
+                _tty.readline()
         except Exception:
             import time
             time.sleep(30)
@@ -1159,6 +1171,7 @@ def do_reseal(luks_key: str = None, pcr_ids: str = None, reboot: bool = True,
     if _plymouth_active():
         subprocess.run(
             ["plymouth", "hide-splash"],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -1236,6 +1249,7 @@ def do_reseal(luks_key: str = None, pcr_ids: str = None, reboot: bool = True,
             for slot in slots:
                 subprocess.run(
                     ["clevis", "luks", "unbind", "-d", real_device, "-s", str(slot), "-f"],
+                    stdin=subprocess.DEVNULL,
                     check=False,
                 )
 
@@ -1243,9 +1257,10 @@ def do_reseal(luks_key: str = None, pcr_ids: str = None, reboot: bool = True,
             ce_pcr = _pcr_ids_cryptenroll_str(pcr_ids)
             # Enroll the new PCR-bound slot FIRST, then wipe the old no-PCR slots.
             r = subprocess.run(
-                ["systemd-cryptenroll", "--tpm2-device=auto",
+                ["systemd-cryptenroll", "--no-ask-password", "--tpm2-device=auto",
                  f"--tpm2-pcrs={ce_pcr}",
                  f"--unlock-key-file={luks_key}", real_device],
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -1260,8 +1275,9 @@ def do_reseal(luks_key: str = None, pcr_ids: str = None, reboot: bool = True,
 
             for slot in slots:
                 subprocess.run(
-                    ["systemd-cryptenroll", f"--wipe-slot={slot}",
+                    ["systemd-cryptenroll", "--no-ask-password", f"--wipe-slot={slot}",
                      f"--unlock-key-file={luks_key}", real_device],
+                    stdin=subprocess.DEVNULL,
                     check=False,
                 )
 
@@ -1695,6 +1711,7 @@ def cmd_pcr_remove(config: dict, device_filter: str | None, slot_filter: int | N
                 # If the bind fails, the original binding is untouched.
                 r = subprocess.run(
                     ["clevis", "luks", "bind", "-d", real_device, "-k", luks_key, "tpm2", "{}"],
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -1702,6 +1719,7 @@ def cmd_pcr_remove(config: dict, device_filter: str | None, slot_filter: int | N
                 if r.returncode == 0:
                     subprocess.run(
                         ["clevis", "luks", "unbind", "-d", real_device, "-s", str(slot), "-f"],
+                        stdin=subprocess.DEVNULL,
                         check=False,
                     )
                     print(f"    Done — original slot {slot} removed, rebound without PCR restriction.")
@@ -1739,8 +1757,9 @@ def cmd_pcr_remove(config: dict, device_filter: str | None, slot_filter: int | N
 
         # Enroll new TPM-only slot FIRST (no --tpm2-pcrs), then wipe old slot(s).
         r = subprocess.run(
-            ["systemd-cryptenroll", "--tpm2-device=auto",
+            ["systemd-cryptenroll", "--no-ask-password", "--tpm2-device=auto",
              f"--unlock-key-file={luks_key}", real_device],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -1748,8 +1767,9 @@ def cmd_pcr_remove(config: dict, device_filter: str | None, slot_filter: int | N
         if r.returncode == 0:
             for slot in target_slots:
                 subprocess.run(
-                    ["systemd-cryptenroll", f"--wipe-slot={slot}",
+                    ["systemd-cryptenroll", "--no-ask-password", f"--wipe-slot={slot}",
                      f"--unlock-key-file={luks_key}", real_device],
+                    stdin=subprocess.DEVNULL,
                     check=False,
                 )
             print(f"    Done — slot(s) {target_slots} wiped, re-enrolled without PCR restriction.")
