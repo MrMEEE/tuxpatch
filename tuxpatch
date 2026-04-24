@@ -67,6 +67,10 @@ DEFAULTS = {
         "luks_password_file": "/etc/tuxpatch/luks.key",
         "pcr_ids": [7],
         "reseal_on_trigger_only": False,
+        # "auto" detects the existing backend per device; falls back to
+        # "cryptenroll" when no binding is found.  Set to "clevis" or
+        # "cryptenroll" to force a specific backend for new enrolments.
+        "backend": "auto",
     },
     "logging": {
         "path": "/var/log/tuxpatch.log",
@@ -629,6 +633,60 @@ def get_clevis_bindings(device: str) -> list:
     return bindings
 
 
+def get_cryptenroll_tpm2_slots(device: str) -> list:
+    """Return list of LUKS slot numbers enrolled with systemd-cryptenroll tpm2."""
+    try:
+        r = subprocess.run(
+            ["systemd-cryptenroll", "--list", device],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except FileNotFoundError:
+        return []
+    slots = []
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "tpm2":
+            try:
+                slots.append(int(parts[0]))
+            except ValueError:
+                pass
+    return slots
+
+
+def _pcr_ids_cryptenroll_str(pcr_ids) -> str:
+    """Format PCR IDs for systemd-cryptenroll --tpm2-pcrs= (uses '+' as separator)."""
+    if isinstance(pcr_ids, str):
+        parts = [p.strip() for p in pcr_ids.split(",")]
+    else:
+        parts = [str(p) for p in pcr_ids]
+    return "+".join(parts)
+
+
+def _detect_tpm2_backend(device: str, real_device: str, preferred_backend: str = "cryptenroll") -> tuple:
+    """Detect which TPM2 backend is active for a device.
+
+    Checks for clevis bindings first, then systemd-cryptenroll TPM2 slots.
+    Returns (backend, slots) where backend is 'clevis' or 'cryptenroll'
+    and slots is the list of existing slot numbers (empty if none configured).
+    When no bindings are found, returns (preferred_backend, []).
+    """
+    clevis_slots = get_clevis_slots(device)
+    if not clevis_slots and real_device != device:
+        clevis_slots = get_clevis_slots(real_device)
+    if clevis_slots:
+        return "clevis", clevis_slots
+
+    ce_slots = get_cryptenroll_tpm2_slots(real_device)
+    if not ce_slots and real_device != device:
+        ce_slots = get_cryptenroll_tpm2_slots(device)
+    if ce_slots:
+        return "cryptenroll", ce_slots
+
+    return preferred_backend, []
+
+
 def read_pcr_values(pcr_ids: list) -> dict:
     """Return {pcr_id: hex_string} for the requested PCR banks.
 
@@ -682,6 +740,17 @@ def _check_key_file(path: str):
         print(f"Warning: {path} is not owned by root.", file=sys.stderr)
 
 
+def _verify_key_unlocks(device: str, key_file: str) -> bool:
+    """Return True if key_file can unlock the LUKS device."""
+    r = subprocess.run(
+        ["cryptsetup", "--key-file", key_file, "open",
+         "--test-passphrase", device],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return r.returncode == 0
+
+
 def unseal_for_update(config: dict) -> bool:
     """
     Pre-update step: switch all clevis/TPM2 bindings from PCR-protected to
@@ -708,7 +777,10 @@ def unseal_for_update(config: dict) -> bool:
 
     # Bind with TPM only, no PCR restrictions: hash+key parameters keep the
     # binding format consistent with the PCR-bound rebind that follows later.
-    tpm_no_pcr = json.dumps({"hash": "sha256", "key": "ecc"})
+    clevis_no_pcr = json.dumps({"hash": "sha256", "key": "ecc"})
+    preferred_backend = config.get("tpm_reseal", {}).get("backend", "auto")
+    if preferred_backend == "auto":
+        preferred_backend = "cryptenroll"
     all_ok = True
 
     for mapper_name, device in devices:
@@ -717,29 +789,75 @@ def unseal_for_update(config: dict) -> bool:
         except Exception:
             real_device = device
 
-        slots = get_clevis_slots(real_device)
-        if not slots:
-            print(f"  {real_device}: no clevis binding found, skipping.")
+        backend, slots = _detect_tpm2_backend(device, real_device, preferred_backend)
+
+        # Verify the key file actually unlocks this device before touching any slots.
+        if not _verify_key_unlocks(real_device, luks_key):
+            print(
+                f"  Error: {luks_key!r} does not unlock {real_device}.\n"
+                f"  Check tpm_reseal.luks_password_file in the config.\n"
+                f"  Hint: cryptsetup --key-file {luks_key} open --test-passphrase {real_device}",
+                file=sys.stderr,
+            )
+            all_ok = False
             continue
 
-        print(f"  {real_device}: removing PCR binding (slots {slots}) → TPM-only...")
-
-        for slot in slots:
-            subprocess.run(
-                ["clevis", "luks", "unbind", "-d", real_device, "-s", str(slot), "-f"],
-                check=False,
-            )
-
-        r = subprocess.run(
-            ["clevis", "luks", "bind", "-d", real_device, "-k", luks_key,
-             "tpm2", tpm_no_pcr],
-            text=True,
-        )
-        if r.returncode != 0:
-            print(f"  Error: clevis bind (no-PCR) failed for {real_device}", file=sys.stderr)
-            all_ok = False
+        if slots:
+            print(f"  {real_device}: switching {backend} binding to TPM-only (slots {slots})...")
         else:
-            print(f"  {real_device}: now TPM-bound without PCR restriction.")
+            print(f"  {real_device}: no TPM2 binding found — enrolling {backend} (TPM-only, no PCR)...")
+
+        if backend == "clevis":
+            # Bind the new no-PCR slot FIRST, then remove the old PCR-bound slots.
+            # This ensures the disk is never left without a working binding if the rebind fails.
+            r = subprocess.run(
+                ["clevis", "luks", "bind", "-d", real_device, "-k", luks_key,
+                 "tpm2", clevis_no_pcr],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if r.returncode != 0:
+                err = (r.stderr or r.stdout or "").strip()
+                print(f"  Error: clevis bind (no-PCR) failed for {real_device} "
+                      f"— original PCR binding kept.", file=sys.stderr)
+                if err:
+                    print(f"  clevis: {err}", file=sys.stderr)
+                all_ok = False
+                continue
+
+            for slot in slots:
+                subprocess.run(
+                    ["clevis", "luks", "unbind", "-d", real_device, "-s", str(slot), "-f"],
+                    check=False,
+                )
+
+        else:  # cryptenroll
+            # Enroll new TPM-only slot FIRST (no --tpm2-pcrs), then wipe old slots.
+            r = subprocess.run(
+                ["systemd-cryptenroll", "--tpm2-device=auto",
+                 f"--unlock-key-file={luks_key}", real_device],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if r.returncode != 0:
+                err = (r.stderr or r.stdout or "").strip()
+                print(f"  Error: systemd-cryptenroll (no-PCR) failed for {real_device} "
+                      f"— original binding kept.", file=sys.stderr)
+                if err:
+                    print(f"  cryptenroll: {err}", file=sys.stderr)
+                all_ok = False
+                continue
+
+            for slot in slots:
+                subprocess.run(
+                    ["systemd-cryptenroll", f"--wipe-slot={slot}",
+                     f"--unlock-key-file={luks_key}", real_device],
+                    check=False,
+                )
+
+        print(f"  {real_device}: now TPM-bound without PCR restriction.")
 
     return all_ok
 
@@ -753,10 +871,15 @@ def install_reseal_service(config: dict) -> None:
     pcr_ids = _pcr_ids_str(config)
     luks_key = config["tpm_reseal"]["luks_password_file"]
 
+    backend = config.get("tpm_reseal", {}).get("backend", "auto")
+    if backend == "auto":
+        backend = "cryptenroll"
+
     Path(STATE_DIR).mkdir(parents=True, exist_ok=True)
     state = {
         "pcr_ids": pcr_ids,
         "luks_password_file": luks_key,
+        "backend": backend,
     }
     with open(RESEAL_PENDING_FILE, "w") as f:
         for k, v in state.items():
@@ -863,15 +986,15 @@ def _read_state_file() -> dict:
     return state
 
 
-def do_reseal(luks_key: str = None, pcr_ids: str = None, reboot: bool = True):
+def do_reseal(luks_key: str = None, pcr_ids: str = None, reboot: bool = True,
+              preferred_backend: str = None):
     """
-    Perform the TPM2 reseal: rebind all clevis slots with the current PCR
+    Perform the TPM2 reseal: rebind all TPM2 slots with the current PCR
     values, clean up state, and reboot.
 
-    When called by the systemd service (--do-reseal), luks_key and pcr_ids
-    are read from the state file.  When called by 'tuxpatch reseal', they
-    are passed directly from the loaded config so the state file is never
-    the source of truth for that path.
+    When called by the systemd service (--do-reseal), luks_key, pcr_ids, and
+    preferred_backend are read from the state file.  When called by
+    'tuxpatch reseal', they are passed directly from the loaded config.
     """
     if luks_key is None or pcr_ids is None:
         # Service path: values must come from the state file.
@@ -883,6 +1006,10 @@ def do_reseal(luks_key: str = None, pcr_ids: str = None, reboot: bool = True):
             pcr_ids = state.get("pcr_ids", "7")
         if luks_key is None:
             luks_key = state.get("luks_password_file", "")
+        if preferred_backend is None:
+            preferred_backend = state.get("backend", "cryptenroll")
+    if not preferred_backend or preferred_backend == "auto":
+        preferred_backend = "cryptenroll"
 
     if not luks_key or not Path(luks_key).exists():
         _boot_error_wait(
@@ -915,8 +1042,8 @@ def do_reseal(luks_key: str = None, pcr_ids: str = None, reboot: bool = True):
     if _plymouth_active():
         _plymouth_message("[TuxPatch] TPM2 Reseal in progress — do not power off")
 
-    # Bind with hash/key/bank consistent with what was used pre-update.
-    tpm_config = json.dumps({
+    # Clevis config — hash/key/bank consistent with what was used pre-update.
+    clevis_tpm_config = json.dumps({
         "hash": "sha256",
         "key": "ecc",
         "pcr_bank": "sha256",
@@ -932,33 +1059,66 @@ def do_reseal(luks_key: str = None, pcr_ids: str = None, reboot: bool = True):
         except Exception:
             real_device = device
 
-        slots = get_clevis_slots(real_device)
-        if not slots:
-            _boot_notify(f"{real_device} ({mapper_name}): no clevis binding, skipping.")
-            continue
+        backend, slots = _detect_tpm2_backend(device, real_device, preferred_backend)
 
-        _boot_notify(f"Resealing {real_device} (slots {slots}) with PCR [{pcr_ids}]...")
+        if slots:
+            _boot_notify(f"Resealing {real_device} ({backend}, slots {slots}) with PCR [{pcr_ids}]...")
+        else:
+            _boot_notify(f"{real_device}: no TPM2 binding — enrolling {backend} with PCR [{pcr_ids}]...")
 
-        # Remove the no-PCR bindings installed before the update
-        for slot in slots:
-            subprocess.run(
-                ["clevis", "luks", "unbind", "-d", real_device, "-s", str(slot), "-f"],
-                check=False,
+        if backend == "clevis":
+            # Bind the new PCR-protected slot FIRST, then remove the old no-PCR slots.
+            # If the bind fails, the original slot is preserved and the loop marks failure.
+            r = subprocess.run(
+                ["clevis", "luks", "bind", "-d", real_device, "-k", luks_key,
+                 "tpm2", clevis_tpm_config],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
             )
+            if r.returncode != 0:
+                err = (r.stderr or r.stdout or "").strip()
+                if err:
+                    _boot_notify(f"clevis error: {err}")
+                reseal_failed = True
+                failed_device = real_device
+                continue
 
-        # Rebind with the current PCR measurements
-        r = subprocess.run(
-            ["clevis", "luks", "bind", "-d", real_device, "-k", luks_key,
-             "tpm2", tpm_config],
-            text=True,
-        )
-        if r.returncode != 0:
-            reseal_failed = True
-            failed_device = real_device
+            for slot in slots:
+                subprocess.run(
+                    ["clevis", "luks", "unbind", "-d", real_device, "-s", str(slot), "-f"],
+                    check=False,
+                )
+
+        else:  # cryptenroll
+            ce_pcr = _pcr_ids_cryptenroll_str(pcr_ids)
+            # Enroll the new PCR-bound slot FIRST, then wipe the old no-PCR slots.
+            r = subprocess.run(
+                ["systemd-cryptenroll", "--tpm2-device=auto",
+                 f"--tpm2-pcrs={ce_pcr}",
+                 f"--unlock-key-file={luks_key}", real_device],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if r.returncode != 0:
+                err = (r.stderr or r.stdout or "").strip()
+                if err:
+                    _boot_notify(f"cryptenroll error: {err}")
+                reseal_failed = True
+                failed_device = real_device
+                continue
+
+            for slot in slots:
+                subprocess.run(
+                    ["systemd-cryptenroll", f"--wipe-slot={slot}",
+                     f"--unlock-key-file={luks_key}", real_device],
+                    check=False,
+                )
 
     if reseal_failed:
         # Leave the state file in place so the service retries on the next boot.
-        _boot_error_wait(f"clevis bind failed for {failed_device}")
+        _boot_error_wait(f"TPM2 reseal failed for {failed_device}")
         sys.exit(1)
 
     _boot_notify("All devices resealed successfully.")
@@ -1202,30 +1362,38 @@ def cmd_pcr_status(config: dict):
     else:
         print("  (unavailable — TPM sysfs not present and tpm2_pcrread not found)")
 
-    # ── 3. Clevis bindings per device ─────────────────────────────────────────
+    # ── 3. TPM2 bindings per device ───────────────────────────────────────────
     devices = get_luks_devices_from_crypttab()
     if devices:
-        print("\nClevis bindings (from /etc/crypttab):")
+        print("\nTPM2 bindings (from /etc/crypttab):")
         for mapper_name, device in devices:
             print(f"  {device}  (mapper: {mapper_name}):")
             try:
                 real_device = str(Path(device).resolve())
             except Exception:
                 real_device = device
-            # Try the original path first (e.g. by-uuid), then the resolved path.
+            # Clevis bindings
             bindings = get_clevis_bindings(device)
             if not bindings and real_device != device:
                 bindings = get_clevis_bindings(real_device)
-            if not bindings:
-                print("    (no clevis bindings found — clevis/TPM2 auto-unlock not configured)")
+            if bindings:
+                for slot, pin, cfg in bindings:
+                    if pin == "tpm2":
+                        pcr_str = cfg.get("pcr_ids", "")
+                        policy = f"PCRs [{pcr_str}]" if pcr_str else "(no PCR restriction)"
+                    else:
+                        policy = ""
+                    print(f"    Slot {slot}: {pin} (clevis)  {policy}".rstrip())
                 continue
-            for slot, pin, cfg in bindings:
-                if pin == "tpm2":
-                    pcr_str = cfg.get("pcr_ids", "")
-                    policy = f"PCRs [{pcr_str}]" if pcr_str else "(no PCR restriction)"
-                else:
-                    policy = ""
-                print(f"    Slot {slot}: {pin}  {policy}".rstrip())
+            # systemd-cryptenroll bindings
+            ce_slots = get_cryptenroll_tpm2_slots(real_device)
+            if not ce_slots and real_device != device:
+                ce_slots = get_cryptenroll_tpm2_slots(device)
+            if ce_slots:
+                for slot in ce_slots:
+                    print(f"    Slot {slot}: tpm2 (systemd-cryptenroll)")
+                continue
+            print("    (no TPM2 binding found — device not configured for TPM auto-unlock)")
     else:
         print("\nNo LUKS devices found in /etc/crypttab.")
 
@@ -1258,6 +1426,9 @@ def cmd_pcr_remove(config: dict, device_filter: str | None, slot_filter: int | N
             f"Set tpm_reseal.luks_password_file in {CONFIG_PATH}"
         )
 
+    # Verify the key file against each device before touching any slots
+    # (checked per-device below, but do an early inventory pass here).
+
     devices = get_luks_devices_from_crypttab()
     if not devices:
         print("No LUKS devices found in /etc/crypttab.")
@@ -1283,43 +1454,103 @@ def cmd_pcr_remove(config: dict, device_filter: str | None, slot_filter: int | N
         except Exception:
             real_device = device
 
+        # ── Clevis path ───────────────────────────────────────────────────────
         # Try the original path first (e.g. by-uuid), then the resolved path.
         bindings = get_clevis_bindings(device)
         if not bindings and real_device != device:
             bindings = get_clevis_bindings(real_device)
-        if not bindings:
-            print(f"  {real_device} ({mapper_name}): no clevis bindings, skipping.")
+        if bindings:
+            for slot, pin, cfg in bindings:
+                if slot_filter is not None and slot != slot_filter:
+                    continue
+                if pin != "tpm2":
+                    print(f"  {real_device} slot {slot}: not a tpm2 binding ({pin}), skipping.")
+                    continue
+                pcr_str = cfg.get("pcr_ids", "")
+                if not pcr_str:
+                    print(f"  {real_device} slot {slot}: already has no PCR restriction.")
+                    continue
+
+                print(f"  {real_device} ({mapper_name}) slot {slot}: removing PCR restriction [{pcr_str}]...")
+                any_action = True
+
+                # Verify the key file unlocks this device before touching any slots.
+                if not _verify_key_unlocks(real_device, luks_key):
+                    print(
+                        f"    Error: {luks_key!r} does not unlock {real_device}.\n"
+                        f"    Check tpm_reseal.luks_password_file in the config.\n"
+                        f"    Hint: cryptsetup --key-file {luks_key} open --test-passphrase {real_device}",
+                        file=sys.stderr,
+                    )
+                    continue
+
+                # Bind the new no-PCR slot FIRST, then unbind the old one.
+                # If the bind fails, the original binding is untouched.
+                r = subprocess.run(
+                    ["clevis", "luks", "bind", "-d", real_device, "-k", luks_key, "tpm2", "{}"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                if r.returncode == 0:
+                    subprocess.run(
+                        ["clevis", "luks", "unbind", "-d", real_device, "-s", str(slot), "-f"],
+                        check=False,
+                    )
+                    print(f"    Done — original slot {slot} removed, rebound without PCR restriction.")
+                else:
+                    err = (r.stderr or r.stdout or "").strip()
+                    print(f"    Error: clevis bind failed — original binding kept.", file=sys.stderr)
+                    if err:
+                        print(f"    clevis: {err}", file=sys.stderr)
             continue
 
-        for slot, pin, cfg in bindings:
-            if slot_filter is not None and slot != slot_filter:
-                continue
-            if pin != "tpm2":
-                print(f"  {real_device} slot {slot}: not a tpm2 binding ({pin}), skipping.")
-                continue
-            pcr_str = cfg.get("pcr_ids", "")
-            if not pcr_str:
-                print(f"  {real_device} slot {slot}: already has no PCR restriction.")
-                continue
+        # ── systemd-cryptenroll path ──────────────────────────────────────────
+        ce_slots = get_cryptenroll_tpm2_slots(real_device)
+        if not ce_slots and real_device != device:
+            ce_slots = get_cryptenroll_tpm2_slots(device)
+        if not ce_slots:
+            print(f"  {real_device} ({mapper_name}): no TPM2 binding found, skipping.")
+            continue
 
-            print(f"  {real_device} ({mapper_name}) slot {slot}: removing PCR restriction [{pcr_str}]...")
-            any_action = True
+        target_slots = [s for s in ce_slots if slot_filter is None or s == slot_filter]
+        if not target_slots:
+            continue
 
-            r = subprocess.run(
-                ["clevis", "luks", "unbind", "-d", real_device, "-s", str(slot), "-f"],
-                check=False,
+        print(f"  {real_device} ({mapper_name}): removing PCR restriction from "
+              f"systemd-cryptenroll slot(s) {target_slots}...")
+        any_action = True
+
+        if not _verify_key_unlocks(real_device, luks_key):
+            print(
+                f"    Error: {luks_key!r} does not unlock {real_device}.\n"
+                f"    Check tpm_reseal.luks_password_file in the config.\n"
+                f"    Hint: cryptsetup --key-file {luks_key} open --test-passphrase {real_device}",
+                file=sys.stderr,
             )
-            if r.returncode != 0:
-                print(f"    Warning: clevis unbind returned {r.returncode}", file=sys.stderr)
+            continue
 
-            r = subprocess.run(
-                ["clevis", "luks", "bind", "-d", real_device, "-k", luks_key, "tpm2", "{}"],
-                text=True,
-            )
-            if r.returncode == 0:
-                print(f"    Done — slot rebound without PCR restriction.")
-            else:
-                print(f"    Error: clevis bind failed (exit {r.returncode}).", file=sys.stderr)
+        # Enroll new TPM-only slot FIRST (no --tpm2-pcrs), then wipe old slot(s).
+        r = subprocess.run(
+            ["systemd-cryptenroll", "--tpm2-device=auto",
+             f"--unlock-key-file={luks_key}", real_device],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if r.returncode == 0:
+            for slot in target_slots:
+                subprocess.run(
+                    ["systemd-cryptenroll", f"--wipe-slot={slot}",
+                     f"--unlock-key-file={luks_key}", real_device],
+                    check=False,
+                )
+            print(f"    Done — slot(s) {target_slots} wiped, re-enrolled without PCR restriction.")
+        else:
+            err = (r.stderr or r.stdout or "").strip()
+            print(f"    Error: systemd-cryptenroll enroll failed — original binding kept.", file=sys.stderr)
+            if err:
+                print(f"    cryptenroll: {err}", file=sys.stderr)
 
     if not any_action:
         print("Nothing to do — no slots with PCR restrictions found.")
@@ -1373,13 +1604,16 @@ def main():
         config = load_config()
         luks_key = config["tpm_reseal"]["luks_password_file"]
         pcr_ids = _pcr_ids_str(config)
+        preferred = config.get("tpm_reseal", {}).get("backend", "auto")
+        if preferred == "auto":
+            preferred = "cryptenroll"
         # Also arm the state file so the systemd service runs on the next
         # boot if the system is rebooted before a manual reseal completes.
         try:
             install_reseal_service(config)
         except Exception as e:
             print(f"Warning: could not write reseal state file: {e}", file=sys.stderr)
-        do_reseal(luks_key=luks_key, pcr_ids=pcr_ids, reboot=False)
+        do_reseal(luks_key=luks_key, pcr_ids=pcr_ids, reboot=False, preferred_backend=preferred)
         return
 
     # pcr-status and pcr-remove don't touch the update lock

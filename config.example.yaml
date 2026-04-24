@@ -109,6 +109,17 @@ tpm_reseal:
   # Default is false even when this key is absent.
   reseal_on_trigger_only: false
 
+  # TPM2 backend to use when no existing binding is found on a device.
+  #
+  #   auto         — detect clevis or systemd-cryptenroll from existing slots;
+  #                  enrol with systemd-cryptenroll when neither is found (default)
+  #   cryptenroll  — always use systemd-cryptenroll for new enrolments
+  #   clevis       — always use clevis for new enrolments
+  #
+  # Existing bindings are always handled by whichever tool created them,
+  # regardless of this setting.
+  backend: auto
+
 # ── Notifications ─────────────────────────────────────────────────────────────
 # Desktop notifications are delivered via org.freedesktop.Notifications (D-Bus)
 # directly to each user's session bus at /run/user/<uid>/bus.
