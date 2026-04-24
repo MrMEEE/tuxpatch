@@ -591,22 +591,77 @@ def get_luks_devices_from_crypttab() -> list:
 
 def get_clevis_slots(device: str) -> list:
     """Return clevis-managed LUKS slot numbers for a device."""
+    return [slot for slot, _pin, _cfg in get_clevis_bindings(device)]
+
+
+def get_clevis_bindings(device: str) -> list:
+    """Return list of (slot, pin, config_dict) for all clevis bindings on a device.
+
+    clevis luks list output: "1: tpm2 '{\"pcr_ids\":\"7\"}'"
+    """
     r = subprocess.run(
         ["clevis", "luks", "list", "-d", device],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
     )
-    slots = []
+    bindings = []
     for line in r.stdout.splitlines():
-        # Output: "1: tpm2 '{"pcr_ids":"7"}'"
-        parts = line.strip().split(":")
-        if parts:
-            try:
-                slots.append(int(parts[0].strip()))
-            except ValueError:
-                pass
-    return slots
+        line = line.strip()
+        if not line:
+            continue
+        colon = line.find(":")
+        if colon < 0:
+            continue
+        try:
+            slot = int(line[:colon].strip())
+        except ValueError:
+            continue
+        rest = line[colon + 1:].strip()
+        parts = rest.split(None, 1)
+        pin = parts[0] if parts else ""
+        cfg_str = parts[1].strip("'") if len(parts) > 1 else ""
+        try:
+            cfg = json.loads(cfg_str)
+        except (json.JSONDecodeError, ValueError):
+            cfg = {}
+        bindings.append((slot, pin, cfg))
+    return bindings
+
+
+def read_pcr_values(pcr_ids: list) -> dict:
+    """Return {pcr_id: hex_string} for the requested PCR banks.
+
+    Tries sysfs (kernel 5.12+) first, then falls back to tpm2_pcrread.
+    """
+    values: dict = {}
+    sysfs_base = Path("/sys/class/tpm/tpm0/pcr-sha256")
+    if sysfs_base.exists():
+        for pcr in pcr_ids:
+            p = sysfs_base / str(pcr)
+            if p.exists():
+                values[pcr] = p.read_text().strip().lower()
+        return values
+
+    # Fallback: tpm2_pcrread sha256:A+B+C
+    pcr_spec = "sha256:" + "+".join(str(p) for p in pcr_ids)
+    r = subprocess.run(
+        ["tpm2_pcrread", pcr_spec],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    # Output:  sha256:\n  7 : 0xABCD...
+    for ln in r.stdout.splitlines():
+        ln = ln.strip()
+        if ":" not in ln or ln.lower().startswith("sha"):
+            continue
+        k, _, v = ln.partition(":")
+        try:
+            values[int(k.strip())] = v.strip().lstrip("0x").lower()
+        except ValueError:
+            pass
+    return values
 
 
 def _pcr_ids_str(config: dict) -> str:
@@ -691,10 +746,9 @@ def unseal_for_update(config: dict) -> bool:
 
 def install_reseal_service(config: dict) -> None:
     """
-    Write the reseal state file and enable the pre-installed
-    tuxpatch-reseal.service so it runs on the next boot.
-    The service unit is shipped by the tuxpatch RPM and is already present
-    at RESEAL_SERVICE_PATH; we never write it ourselves.
+    Write the reseal state file so the pre-installed tuxpatch-reseal.service
+    picks it up on the next boot.  The service unit is shipped and enabled by
+    the tuxpatch RPM; this function only manages the state file.
     """
     pcr_ids = _pcr_ids_str(config)
     luks_key = config["tpm_reseal"]["luks_password_file"]
@@ -708,9 +762,7 @@ def install_reseal_service(config: dict) -> None:
         for k, v in state.items():
             f.write(f"{k}={v}\n")
     Path(RESEAL_PENDING_FILE).chmod(0o600)
-
-    subprocess.run(["systemctl", "enable", RESEAL_SERVICE_NAME], check=True)
-    print(f"Enabled {RESEAL_SERVICE_NAME}")
+    print(f"Reseal state written — {RESEAL_SERVICE_NAME} will run on next boot.")
 
 
 
@@ -1115,12 +1167,170 @@ def cmd_status(config: dict):
     else:
         print("\nflatpak not installed — skipping flatpak status.")
 
+# ── PCR commands ─────────────────────────────────────────────────────────────
+
+
+def cmd_pcr_status(config: dict):
+    """Show current and configured PCR state, clevis bindings, and pending reseal."""
+    reseal_cfg = config.get("tpm_reseal", {})
+    cfg_pcr_ids = reseal_cfg.get("pcr_ids", [7])
+    key_file = reseal_cfg.get("luks_password_file", "(not set)")
+    enabled = reseal_cfg.get("enabled", False)
+
+    print("── TPM2 / Clevis PCR Status ─────────────────────────────────────")
+
+    # ── 1. Config ─────────────────────────────────────────────────────────────
+    print("\nConfig (tuxpatch):")
+    print(f"  TPM reseal : {'enabled' if enabled else 'disabled'}")
+    print(f"  PCR IDs    : {cfg_pcr_ids}")
+    print(f"  Key file   : {key_file}")
+
+    # ── 2. Current live PCR values ────────────────────────────────────────────
+    print("\nCurrent PCR values (SHA-256):")
+    pcr_values = read_pcr_values(cfg_pcr_ids)
+    if pcr_values:
+        for pcr, val in sorted(pcr_values.items()):
+            print(f"  PCR {pcr:<3}: {val}")
+    else:
+        print("  (unavailable — TPM sysfs not present and tpm2_pcrread not found)")
+
+    # ── 3. Clevis bindings per device ─────────────────────────────────────────
+    devices = get_luks_devices_from_crypttab()
+    if devices:
+        print("\nClevis bindings (from /etc/crypttab):")
+        for mapper_name, device in devices:
+            print(f"  {device}  (mapper: {mapper_name}):")
+            try:
+                real_device = str(Path(device).resolve())
+            except Exception:
+                real_device = device
+            bindings = get_clevis_bindings(real_device)
+            if not bindings:
+                print("    (no clevis bindings found)")
+                continue
+            for slot, pin, cfg in bindings:
+                if pin == "tpm2":
+                    pcr_str = cfg.get("pcr_ids", "")
+                    policy = f"PCRs [{pcr_str}]" if pcr_str else "(no PCR restriction)"
+                else:
+                    policy = ""
+                print(f"    Slot {slot}: {pin}  {policy}".rstrip())
+    else:
+        print("\nNo LUKS devices found in /etc/crypttab.")
+
+    # ── 4. Pending reseal ─────────────────────────────────────────────────────
+    pending = Path(RESEAL_PENDING_FILE)
+    if pending.exists():
+        try:
+            state = _read_state_file()
+            print("\nPending reseal: YES")
+            print(f"  Kernel     : {state.get('kernel_version', '?')}")
+            print(f"  Target PCRs: [{state.get('pcr_ids', '?')}]")
+            print("  (tuxpatch-reseal.service will rebind clevis on next boot)")
+        except Exception:
+            print("\nPending reseal: YES (state file unreadable)")
+    else:
+        print("\nPending reseal: NO")
+
+
+def cmd_pcr_remove(config: dict, device_filter: str | None, slot_filter: int | None):
+    """Rebind clevis slots without PCR restrictions.
+
+    The binding stays TPM2-backed (disk still auto-unlocks via TPM) but the
+    PCR policy is dropped so PCR measurements no longer gate the unseal.
+    Requires the LUKS key file from tpm_reseal.luks_password_file.
+    """
+    luks_key = config.get("tpm_reseal", {}).get("luks_password_file", "")
+    if not luks_key or not Path(luks_key).exists():
+        sys.exit(
+            f"Error: LUKS key file not found: {luks_key!r}\n"
+            f"Set tpm_reseal.luks_password_file in {CONFIG_PATH}"
+        )
+
+    devices = get_luks_devices_from_crypttab()
+    if not devices:
+        print("No LUKS devices found in /etc/crypttab.")
+        return
+
+    if device_filter:
+        filtered = []
+        for m, d in devices:
+            try:
+                real_d = str(Path(d).resolve())
+            except Exception:
+                real_d = d
+            if d == device_filter or m == device_filter or real_d == device_filter:
+                filtered.append((m, d))
+        if not filtered:
+            sys.exit(f"Error: device {device_filter!r} not found in /etc/crypttab")
+        devices = filtered
+
+    any_action = False
+    for mapper_name, device in devices:
+        try:
+            real_device = str(Path(device).resolve())
+        except Exception:
+            real_device = device
+
+        bindings = get_clevis_bindings(real_device)
+        if not bindings:
+            print(f"  {real_device} ({mapper_name}): no clevis bindings, skipping.")
+            continue
+
+        for slot, pin, cfg in bindings:
+            if slot_filter is not None and slot != slot_filter:
+                continue
+            if pin != "tpm2":
+                print(f"  {real_device} slot {slot}: not a tpm2 binding ({pin}), skipping.")
+                continue
+            pcr_str = cfg.get("pcr_ids", "")
+            if not pcr_str:
+                print(f"  {real_device} slot {slot}: already has no PCR restriction.")
+                continue
+
+            print(f"  {real_device} ({mapper_name}) slot {slot}: removing PCR restriction [{pcr_str}]...")
+            any_action = True
+
+            r = subprocess.run(
+                ["clevis", "luks", "unbind", "-d", real_device, "-s", str(slot), "-f"],
+                check=False,
+            )
+            if r.returncode != 0:
+                print(f"    Warning: clevis unbind returned {r.returncode}", file=sys.stderr)
+
+            r = subprocess.run(
+                ["clevis", "luks", "bind", "-d", real_device, "-k", luks_key, "tpm2", "{}"],
+                text=True,
+            )
+            if r.returncode == 0:
+                print(f"    Done — slot rebound without PCR restriction.")
+            else:
+                print(f"    Error: clevis bind failed (exit {r.returncode}).", file=sys.stderr)
+
+    if not any_action:
+        print("Nothing to do — no slots with PCR restrictions found.")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 
 def _usage():
     name = Path(sys.argv[0]).name
-    print(f"Usage: {name} {{update|status|--do-reseal|--version}}", file=sys.stderr)
+    print(
+        f"Usage: {name} <command> [args]\n"
+        f"\n"
+        f"Commands:\n"
+        f"  update                  Apply all pending updates\n"
+        f"  status                  Show pending updates and TPM reseal state\n"
+        f"  pcr-status              Show current PCR values and clevis bindings\n"
+        f"  pcr-remove [<device>] [<slot>]\n"
+        f"                          Remove PCR restrictions from clevis binding(s)\n"
+        f"  reseal                  Manually run the TPM2/LUKS reseal now\n"
+        f"                          (same as the boot-time service; requires the\n"
+        f"                          reseal.pending state file to be present)\n"
+        f"  --version               Print version and exit",
+        file=sys.stderr,
+    )
 
 
 def main():
@@ -1137,10 +1347,30 @@ def main():
         print(f"tuxpatch {VERSION}")
         return
 
-    # --do-reseal runs at boot inside a one-shot service; skip the lock so a
-    # manual invocation of 'tuxpatch update' in parallel doesn't block it.
-    if command == "--do-reseal":
+    # --do-reseal: used by the systemd service on boot.
+    # reseal:      user-friendly alias for manual invocations.
+    # Neither acquires the update lock — reseal is independent of update.
+    if command in ("--do-reseal", "reseal"):
         do_reseal()
+        return
+
+    # pcr-status and pcr-remove don't touch the update lock
+    if command == "pcr-status":
+        config = load_config()
+        cmd_pcr_status(config)
+        return
+
+    if command == "pcr-remove":
+        config = load_config()
+        # pcr-remove [<device>] [<slot>]
+        device_filter = sys.argv[2] if len(sys.argv) > 2 else None
+        slot_filter: int | None = None
+        if len(sys.argv) > 3:
+            try:
+                slot_filter = int(sys.argv[3])
+            except ValueError:
+                sys.exit(f"Error: slot must be an integer, got {sys.argv[3]!r}")
+        cmd_pcr_remove(config, device_filter, slot_filter)
         return
 
     acquire_lock()

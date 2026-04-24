@@ -1,20 +1,18 @@
 #
 # tuxpatch-reseal.service
 #
-# One-shot service installed by 'tuxpatch update' before rebooting after an
-# RPM update.  On the first boot after the update it:
+# Shipped and enabled by the tuxpatch RPM.  The ConditionPathExists= guard
+# means it is a no-op at boot unless tuxpatch has armed it by writing
+# /var/lib/tuxpatch/reseal.pending.
+#
+# When armed (after 'tuxpatch update' detects a pending reseal), on the
+# first boot after the update it:
 #
 #   1. Rebinds all clevis/TPM2 LUKS slots against the fresh (post-update)
 #      PCR measurements, using the passphrase from luks_password_file to
 #      authorise the key-slot change.
-#   2. Disables and removes itself.
+#   2. Removes the pending-state file.
 #   3. Reboots so the system comes up with full PCR protection restored.
-#
-# This service is not enabled or installed by the tuxpatch RPM itself —
-# it is written to /etc/systemd/system/ and enabled at run-time by
-# 'tuxpatch update' whenever a reseal is needed.  The file shipped here
-# serves as a reference template and is included in the RPM only for
-# documentation / packaging completeness.
 #
 # See: /usr/bin/tuxpatch --do-reseal
 #
