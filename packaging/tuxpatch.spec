@@ -86,11 +86,11 @@ install -D -m 0644 packaging/tuxpatch-reseal.service \
 %{_unitdir}/tuxpatch-reseal.service
 
 %post
-# Enable on fresh install. The ConditionPathExists guard in the unit means it
-# is a no-op at boot unless tuxpatch has armed it by creating the state file.
-if [ $1 -eq 1 ]; then
-    systemctl enable tuxpatch-reseal.service >/dev/null 2>&1 || :
-fi
+# Enable on every install and upgrade. The ConditionPathExists guard in the
+# unit means it is a no-op at boot unless tuxpatch has armed it by creating
+# the state file, so enabling it unconditionally is safe.
+systemctl daemon-reload >/dev/null 2>&1 || :
+systemctl enable tuxpatch-reseal.service >/dev/null 2>&1 || :
 
 %preun
 # Disable and stop the service on uninstall (not on upgrade).

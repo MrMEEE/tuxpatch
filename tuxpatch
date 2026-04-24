@@ -863,28 +863,32 @@ def _read_state_file() -> dict:
     return state
 
 
-def do_reseal():
+def do_reseal(luks_key: str = None, pcr_ids: str = None):
     """
-    Internal command invoked by the reseal systemd service on the first boot
-    after an RPM update.  At this point the system has booted normally — the
-    LUKS volume was unlocked by the TPM without PCR verification (the
-    binding was relaxed by tuxpatch before the update).
+    Perform the TPM2 reseal: rebind all clevis slots with the current PCR
+    values, clean up state, and reboot.
 
-    Steps:
-      1. Rebind all clevis slots with the *current* (post-update) PCR values.
-      2. Clean up the state file and disable/remove the service.
-      3. Reboot so the system comes up with full PCR protection restored.
+    When called by the systemd service (--do-reseal), luks_key and pcr_ids
+    are read from the state file.  When called by 'tuxpatch reseal', they
+    are passed directly from the loaded config so the state file is never
+    the source of truth for that path.
     """
-    if not Path(RESEAL_PENDING_FILE).exists():
-        print("No reseal pending.", file=sys.stderr)
-        return
-
-    state = _read_state_file()
-    pcr_ids = state.get("pcr_ids", "7")
-    luks_key = state.get("luks_password_file", "")
+    if luks_key is None or pcr_ids is None:
+        # Service path: values must come from the state file.
+        if not Path(RESEAL_PENDING_FILE).exists():
+            print("No reseal pending.", file=sys.stderr)
+            return
+        state = _read_state_file()
+        if pcr_ids is None:
+            pcr_ids = state.get("pcr_ids", "7")
+        if luks_key is None:
+            luks_key = state.get("luks_password_file", "")
 
     if not luks_key or not Path(luks_key).exists():
-        _boot_error_wait(f"LUKS key file not found: {luks_key}")
+        _boot_error_wait(
+            f"LUKS key file not found: {luks_key!r}\n"
+            "Set tpm_reseal.luks_password_file in the config."
+        )
         sys.exit(1)
 
     # Hide Plymouth so the text banner is always visible on tty1
@@ -1347,11 +1351,25 @@ def main():
         print(f"tuxpatch {VERSION}")
         return
 
-    # --do-reseal: used by the systemd service on boot.
-    # reseal:      user-friendly alias for manual invocations.
+    # --do-reseal: used by the systemd service on boot (requires state file).
+    # reseal:      manual user command — arms the state file from config if
+    #              it doesn't already exist, then runs the reseal.
     # Neither acquires the update lock — reseal is independent of update.
-    if command in ("--do-reseal", "reseal"):
+    if command == "--do-reseal":
         do_reseal()
+        return
+
+    if command == "reseal":
+        config = load_config()
+        luks_key = config["tpm_reseal"]["luks_password_file"]
+        pcr_ids = _pcr_ids_str(config)
+        # Also arm the state file so the systemd service runs on the next
+        # boot if the system is rebooted before a manual reseal completes.
+        try:
+            install_reseal_service(config)
+        except Exception as e:
+            print(f"Warning: could not write reseal state file: {e}", file=sys.stderr)
+        do_reseal(luks_key=luks_key, pcr_ids=pcr_ids)
         return
 
     # pcr-status and pcr-remove don't touch the update lock
