@@ -53,7 +53,12 @@ flatpak:  # Set to false to skip all flatpak updates (system and per-user).
   enabled: true
   # Run /usr/bin/flat-manager-checkin after flatpak updates, if it exists.
   flat_manager_checkin: true
-
+# ── Firmware updates ──────────────────────────────────────────────────────────
+firmware:
+  # Set to true to check and install firmware updates via fwupdmgr.
+  # Requires fwupd to be installed (dnf install fwupd).
+  # Disabled by default.
+  enabled: false
 # ── TPM2 / LUKS Reseal ───────────────────────────────────────────────────────
 # When any RPM package is updated, PCR measurements may change on the next
 # boot (especially shim, GRUB, or kernel updates affect PCR7).  The existing
@@ -102,12 +107,33 @@ tpm_reseal:
   pcr_ids: [7]
 
   # When true, the reseal workflow only triggers when a package listed in
-  # RESEAL_TRIGGERS (kernel, shim, grub2, …) is updated, because those are
-  # the packages known to change PCR7 measurements.
+  # RESEAL_TRIGGERS (kernel, shim, grub2, …) or reseal_triggers (below) is
+  # updated, because those are the packages known to change PCR7 measurements.
   # When false (default), the reseal runs on every RPM update as a safety
   # net against packages that might indirectly affect PCR values.
   # Default is false even when this key is absent.
   reseal_on_trigger_only: false
+
+  # Package name prefixes that trigger a reseal.  When set, this list
+  # *replaces* the built-in defaults (kernel, shim, grub2, …) entirely.
+  # Comparison is done against the base package name (without version/arch),
+  # so "fwupd" also matches "fwupd-1.9.3-1.fc40.x86_64".
+  # When absent or empty, the built-in list is used.
+  # reseal_triggers:
+  #   - kernel
+  #   - kernel-core
+  #   - shim
+  #   - grub2-efi-x64
+  #   - fwupd
+
+  # Package name prefixes to exclude from triggering a reseal.  Useful with
+  # reseal_on_trigger_only: false to ignore packages that are updated
+  # frequently but don't affect PCR measurements.
+  # For example, to prevent a reseal on every kernel-debug or debug-info
+  # package update:
+  # reseal_exclude:
+  #   - kernel-debug
+  #   - kernel-devel
 
   # TPM2 backend to use when no existing binding is found on a device.
   #
@@ -149,4 +175,7 @@ notifications:  # Set to false to disable all desktop notifications.
 
   # Message when a package from migrate_packages was updated.
   msg_migrate_updated: "New system configuration has been applied, the system might need a reboot for all changes to apply"
+
+  # Message when firmware was updated (sent after fwupdmgr update completes).
+  msg_firmware_updated: "New firmware for your machine has been prepared, please reboot to complete installation"
 

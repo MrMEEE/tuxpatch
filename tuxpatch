@@ -36,8 +36,7 @@ STATE_DIR  = "/var/lib/tuxpatch"
 RESEAL_PENDING_FILE = f"{STATE_DIR}/reseal.pending"
 RESEAL_SERVICE_NAME = "tuxpatch-reseal.service"
 
-# Package prefixes that are known to change PCR7 measurements — used only
-# for informational display in 'tuxpatch status'.
+# Package prefixes that are known to change PCR7 measurements.
 RESEAL_TRIGGERS = (
     "kernel",
     "kernel-core",
@@ -69,10 +68,18 @@ DEFAULTS = {
         "luks_password_file": "/etc/tuxpatch/luks.key",
         "pcr_ids": [7],
         "reseal_on_trigger_only": False,
+        # Package name prefixes that trigger a reseal.  When set, this list
+        # replaces the built-in RESEAL_TRIGGERS entirely (not additive).
+        "reseal_triggers": [],
+        # Package name prefixes to exclude from triggering a reseal.
+        "reseal_exclude": [],
         # "auto" detects the existing backend per device; falls back to
         # "cryptenroll" when no binding is found.  Set to "clevis" or
         # "cryptenroll" to force a specific backend for new enrolments.
         "backend": "auto",
+    },
+    "firmware": {
+        "enabled": False,
     },
     "logging": {
         "path": "/var/log/tuxpatch.log",
@@ -87,6 +94,7 @@ DEFAULTS = {
         "msg_rpm_updated": "The system has been updated",
         "msg_kernel_updated": "A new system kernel has been installed, please reboot.",
         "msg_migrate_updated": "New system configuration has been applied, the system might need a reboot for all changes to apply",
+        "msg_firmware_updated": "New firmware for your machine has been prepared, please reboot to complete installation",
     },
 }
 
@@ -490,6 +498,58 @@ def run_flat_manager_checkin():
         subprocess.run([str(checkin)], check=False)
 
 
+# ── Firmware (fwupdmgr) ───────────────────────────────────────────────────────
+
+
+def _fwupdmgr_available() -> bool:
+    return Path("/usr/bin/fwupdmgr").exists()
+
+
+def _fwupd_refresh() -> None:
+    """Refresh fwupdmgr metadata (ignore errors; stale cache is acceptable)."""
+    subprocess.run(
+        ["fwupdmgr", "refresh", "--force"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def get_firmware_updates() -> list[str]:
+    """Return device names with pending firmware updates, or an empty list.
+
+    Does NOT refresh metadata — call _fwupd_refresh() first when up-to-date
+    results are needed (e.g. during an update run).
+    """
+    r = subprocess.run(
+        ["fwupdmgr", "get-updates", "--json"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    # exit 2 = FWUPD_ERROR_NOTHING_TO_DO (no updates available)
+    if r.returncode != 0:
+        return []
+    try:
+        data = json.loads(r.stdout)
+        return [d.get("Name", "Unknown device") for d in data.get("Devices", [])]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        # Unable to parse JSON — trust the exit code and return a generic entry
+        return ["(firmware updates available)"]
+
+
+def install_firmware_updates() -> bool:
+    """Install pending firmware updates without triggering an immediate reboot.
+
+    Returns True on success (exit 0), False otherwise.
+    fwupdmgr output is forwarded directly so progress is visible in the log.
+    """
+    r = subprocess.run(
+        ["fwupdmgr", "update", "--no-reboot-check"],
+        text=True,
+    )
+    return r.returncode == 0
+
+
 # ── RPM / DNF ─────────────────────────────────────────────────────────────────
 
 
@@ -557,12 +617,27 @@ def run_migrate_post_install_scripts(migrate_package_names: list[str], updated_r
             )
 
 
-def kernel_or_shim_will_update(rpm_updates: list) -> bool:
+def kernel_or_shim_will_update(rpm_updates: list, config: dict | None = None) -> bool:
+    """Return True if any package in *rpm_updates* should trigger a reseal.
+
+    The built-in RESEAL_TRIGGERS list is extended by
+    ``tpm_reseal.reseal_triggers`` and filtered by ``tpm_reseal.reseal_exclude``
+    from *config*.
+    """
+    reseal_cfg = (config or {}).get("tpm_reseal", {})
+    cfg_triggers: list = [str(t) for t in reseal_cfg.get("reseal_triggers", [])]
+    exclude: list = [str(e) for e in reseal_cfg.get("reseal_exclude", [])]
+    # If reseal_triggers is explicitly set in config, it replaces the built-in
+    # list entirely; otherwise the built-in RESEAL_TRIGGERS is used.
+    triggers = tuple(cfg_triggers) if cfg_triggers else RESEAL_TRIGGERS
+
     for pkg in rpm_updates:
         base = _pkg_base(pkg)
-        for trigger in RESEAL_TRIGGERS:
-            if base == trigger or base.startswith(trigger + "-"):
-                return True
+        # Check exclude list first — any matching prefix removes the package.
+        if any(base == ex or base.startswith(ex + "-") for ex in exclude):
+            continue
+        if any(base == tr or base.startswith(tr + "-") for tr in triggers):
+            return True
     return False
 
 
@@ -1231,9 +1306,18 @@ def cmd_update(config: dict):
 
     if reseal_enabled:
         if reseal_on_trigger_only:
-            needs_reseal = kernel_or_shim_will_update(rpm_updates)
+            needs_reseal = kernel_or_shim_will_update(rpm_updates, config)
         else:
-            needs_reseal = bool(rpm_updates)
+            reseal_cfg = config["tpm_reseal"]
+            exclude: list = [str(e) for e in reseal_cfg.get("reseal_exclude", [])]
+            filtered = [
+                p for p in rpm_updates
+                if not any(
+                    _pkg_base(p) == ex or _pkg_base(p).startswith(ex + "-")
+                    for ex in exclude
+                )
+            ]
+            needs_reseal = bool(filtered)
     else:
         needs_reseal = False
 
@@ -1297,7 +1381,27 @@ def cmd_update(config: dict):
     if rpm_did_update and rpm_updates:
         run_migrate_post_install_scripts(migrate_package_names, rpm_updates)
 
-    # ── 8. RPM notifications ──────────────────────────────────────────────────
+    # ── 8. Firmware updates ───────────────────────────────────────────────────
+    firmware_cfg = config.get("firmware", {})
+    firmware_enabled = firmware_cfg.get("enabled", False)
+    firmware_updated = False
+    if firmware_enabled:
+        if _fwupdmgr_available():
+            print("\nChecking firmware updates...")
+            _fwupd_refresh()
+            fw_updates = get_firmware_updates()
+            if fw_updates:
+                print(f"  Found updates for: {', '.join(fw_updates)}")
+                print("Installing firmware updates...")
+                firmware_updated = install_firmware_updates()
+                if not firmware_updated:
+                    print("Warning: fwupdmgr update reported a non-zero exit code.", file=sys.stderr)
+            else:
+                print("No firmware updates available.")
+        else:
+            print("Warning: firmware updates enabled but fwupdmgr not found.", file=sys.stderr)
+
+    # ── 9. RPM and firmware notifications ─────────────────────────────────────
     if notif_enabled and rpm_did_update and rpm_updates and users:
         if kernel_will_update:
             notify_all_users(users, "TuxPatch", notif["msg_kernel_updated"])
@@ -1305,8 +1409,11 @@ def cmd_update(config: dict):
             notify_all_users(users, "TuxPatch", notif["msg_migrate_updated"])
         if not kernel_will_update and not migrate_will_update:
             notify_all_users(users, "TuxPatch", notif["msg_rpm_updated"])
+    if notif_enabled and firmware_updated and users:
+        msg_fw = notif.get("msg_firmware_updated", DEFAULTS["notifications"]["msg_firmware_updated"])
+        notify_all_users(users, "TuxPatch", msg_fw)
 
-    # ── 9. TPM reseal: write state file and reboot ───────────────────────────
+    # ── 10. TPM reseal: write state file and reboot ───────────────────────────
     if needs_reseal and rpm_did_update:
         print("\nPCR binding relaxed. Writing reseal state and rebooting...")
         try:
@@ -1361,13 +1468,24 @@ def cmd_status(config: dict):
         pcr_ids = config["tpm_reseal"].get("pcr_ids", [7])
         key_file = config["tpm_reseal"]["luks_password_file"]
         trigger_only = config["tpm_reseal"].get("reseal_on_trigger_only", False)
+        reseal_cfg = config["tpm_reseal"]
+        exclude: list = [str(e) for e in reseal_cfg.get("reseal_exclude", [])]
         if trigger_only:
-            reseal_triggers = [p for p in rpm_updates if kernel_or_shim_will_update([p])]
+            reseal_triggers = [p for p in rpm_updates if kernel_or_shim_will_update([p], config)]
             trigger_desc = f"trigger packages only ({', '.join(reseal_triggers) if reseal_triggers else 'none pending'})"
             will_reseal = bool(reseal_triggers)
         else:
+            filtered = [
+                p for p in rpm_updates
+                if not any(
+                    _pkg_base(p) == ex or _pkg_base(p).startswith(ex + "-")
+                    for ex in exclude
+                )
+            ]
             trigger_desc = "any RPM update"
-            will_reseal = bool(rpm_updates)
+            if exclude:
+                trigger_desc += f" (excluding: {', '.join(exclude)})"
+            will_reseal = bool(filtered)
         print(f"\nTPM Reseal: enabled (mode: {trigger_desc})")
         print(f"  PCR IDs : {pcr_ids}")
         print(f"  Key file: {key_file}")
@@ -1405,6 +1523,21 @@ def cmd_status(config: dict):
             print("  (none)")
     else:
         print("\nflatpak not installed — skipping flatpak status.")
+
+    # ── Firmware updates ──────────────────────────────────────────────────────
+    firmware_cfg = config.get("firmware", {})
+    if not firmware_cfg.get("enabled", False):
+        print("\nFirmware updates: Disabled in config")
+    elif _fwupdmgr_available():
+        print("\nPending firmware updates:")
+        fw_updates = get_firmware_updates()
+        if fw_updates:
+            for dev in fw_updates:
+                print(f"  {dev}")
+        else:
+            print("  (none)")
+    else:
+        print("\nfwupdmgr not installed — skipping firmware status.")
 
 # ── PCR commands ─────────────────────────────────────────────────────────────
 
