@@ -28,7 +28,7 @@ try:
 except ImportError:
     sys.exit("Error: PyYAML is required. Install with: dnf install python3-pyyaml")
 
-VERSION = "1.2.3"
+VERSION = "1.2.4"
 
 CONFIG_PATH = "/etc/tuxpatch/config"
 LOCKFILE   = "/var/run/tuxpatch.pid"
