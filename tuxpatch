@@ -923,8 +923,9 @@ def unseal_for_update(config: dict) -> bool:
 def install_reseal_service(config: dict) -> None:
     """
     Write the reseal state file so the pre-installed tuxpatch-reseal.service
-    picks it up on the next boot.  The service unit is shipped and enabled by
-    the tuxpatch RPM; this function only manages the state file.
+    picks it up on the next boot.  The service unit is shipped and permanently
+    enabled by the tuxpatch RPM; the ConditionPathExists= guard in the unit
+    means it is a no-op at boot unless this state file is present.
     """
     pcr_ids = _pcr_ids_str(config)
     luks_key = config["tpm_reseal"]["luks_password_file"]
@@ -1197,8 +1198,6 @@ def do_reseal(luks_key: str = None, pcr_ids: str = None, reboot: bool = True,
     _boot_notify("All devices resealed successfully.")
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
-    # Disable the service (the unit file is RPM-managed, never deleted).
-    subprocess.run(["systemctl", "disable", RESEAL_SERVICE_NAME], check=False)
     Path(RESEAL_PENDING_FILE).unlink(missing_ok=True)
 
     if reboot:
@@ -1307,16 +1306,16 @@ def cmd_update(config: dict):
         if not kernel_will_update and not migrate_will_update:
             notify_all_users(users, "TuxPatch", notif["msg_rpm_updated"])
 
-    # ── 9. TPM reseal: install service and reboot ─────────────────────────────
+    # ── 9. TPM reseal: write state file and reboot ───────────────────────────
     if needs_reseal and rpm_did_update:
-        print("\nPCR binding relaxed. Installing reseal service and rebooting...")
+        print("\nPCR binding relaxed. Writing reseal state and rebooting...")
         try:
             install_reseal_service(config)
         except Exception as e:
-            print(f"Error: could not install reseal service: {e}", file=sys.stderr)
+            print(f"Error: could not write reseal state: {e}", file=sys.stderr)
             print(
-                "Warning: PCR binding has been removed but the reseal service "
-                "could not be installed. Run 'tuxpatch --do-reseal' manually "
+                "Warning: PCR binding has been removed but the reseal state "
+                "could not be written. Run 'tuxpatch --do-reseal' manually "
                 "after the next boot.",
                 file=sys.stderr,
             )
@@ -1324,17 +1323,17 @@ def cmd_update(config: dict):
         subprocess.run(["systemctl", "reboot"])
     elif needs_reseal and not rpm_did_update:
         # Update failed after we already relaxed the PCR binding.
-        # Install the service anyway so the reseal runs on the next boot
+        # Write the state file anyway so the reseal runs on next boot
         # and PCR protection is restored.
         print(
             "\nWarning: RPM update failed but PCR binding was already relaxed. "
-            "Installing reseal service so protection is restored on next boot.",
+            "Writing reseal state so protection is restored on next boot.",
             file=sys.stderr,
         )
         try:
             install_reseal_service(config)
         except Exception as e:
-            print(f"Error: could not install reseal service: {e}", file=sys.stderr)
+            print(f"Error: could not write reseal state: {e}", file=sys.stderr)
     else:
         print("\nUpdate complete.")
 
