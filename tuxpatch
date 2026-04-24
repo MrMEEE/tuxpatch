@@ -863,7 +863,7 @@ def _read_state_file() -> dict:
     return state
 
 
-def do_reseal(luks_key: str = None, pcr_ids: str = None):
+def do_reseal(luks_key: str = None, pcr_ids: str = None, reboot: bool = True):
     """
     Perform the TPM2 reseal: rebind all clevis slots with the current PCR
     values, clean up state, and reboot.
@@ -968,8 +968,11 @@ def do_reseal(luks_key: str = None, pcr_ids: str = None):
     subprocess.run(["systemctl", "disable", RESEAL_SERVICE_NAME], check=False)
     Path(RESEAL_PENDING_FILE).unlink(missing_ok=True)
 
-    _boot_notify("Reseal complete — rebooting into fully protected system.")
-    subprocess.run(["systemctl", "reboot"])
+    if reboot:
+        _boot_notify("Reseal complete — rebooting into fully protected system.")
+        subprocess.run(["systemctl", "reboot"])
+    else:
+        print("Reseal complete.")
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -1190,7 +1193,8 @@ def cmd_pcr_status(config: dict):
     print(f"  Key file   : {key_file}")
 
     # ── 2. Current live PCR values ────────────────────────────────────────────
-    print("\nCurrent PCR values (SHA-256):")
+    print("\nLive TPM PCR measurements (SHA-256):")
+    print("  (these are current TPM values, not LUKS binding state)")
     pcr_values = read_pcr_values(cfg_pcr_ids)
     if pcr_values:
         for pcr, val in sorted(pcr_values.items()):
@@ -1208,9 +1212,12 @@ def cmd_pcr_status(config: dict):
                 real_device = str(Path(device).resolve())
             except Exception:
                 real_device = device
-            bindings = get_clevis_bindings(real_device)
+            # Try the original path first (e.g. by-uuid), then the resolved path.
+            bindings = get_clevis_bindings(device)
+            if not bindings and real_device != device:
+                bindings = get_clevis_bindings(real_device)
             if not bindings:
-                print("    (no clevis bindings found)")
+                print("    (no clevis bindings found — clevis/TPM2 auto-unlock not configured)")
                 continue
             for slot, pin, cfg in bindings:
                 if pin == "tpm2":
@@ -1276,7 +1283,10 @@ def cmd_pcr_remove(config: dict, device_filter: str | None, slot_filter: int | N
         except Exception:
             real_device = device
 
-        bindings = get_clevis_bindings(real_device)
+        # Try the original path first (e.g. by-uuid), then the resolved path.
+        bindings = get_clevis_bindings(device)
+        if not bindings and real_device != device:
+            bindings = get_clevis_bindings(real_device)
         if not bindings:
             print(f"  {real_device} ({mapper_name}): no clevis bindings, skipping.")
             continue
@@ -1369,7 +1379,7 @@ def main():
             install_reseal_service(config)
         except Exception as e:
             print(f"Warning: could not write reseal state file: {e}", file=sys.stderr)
-        do_reseal(luks_key=luks_key, pcr_ids=pcr_ids)
+        do_reseal(luks_key=luks_key, pcr_ids=pcr_ids, reboot=False)
         return
 
     # pcr-status and pcr-remove don't touch the update lock
