@@ -1228,6 +1228,43 @@ def do_reseal(luks_key: str = None, pcr_ids: str = None, reboot: bool = True,
             _boot_notify(f"{real_device}: no TPM2 binding — enrolling {backend} with PCR [{pcr_ids}]...")
 
         if backend == "clevis":
+            # If existing bindings still carry PCR restrictions (unseal_for_update was
+            # not called before arming the reseal), strip the PCR restriction first so
+            # the new binding is sealed against the current, correct PCR measurements.
+            existing_bindings = get_clevis_bindings(real_device)
+            if not existing_bindings and real_device != device:
+                existing_bindings = get_clevis_bindings(device)
+            pcr_still_bound = [
+                s for s, pin, cfg in existing_bindings
+                if pin == "tpm2" and cfg.get("pcr_ids")
+            ]
+            if pcr_still_bound:
+                _boot_notify(
+                    f"{real_device}: bindings still PCR-restricted — stripping PCR before reseal..."
+                )
+                clevis_no_pcr = json.dumps({"hash": "sha256", "key": "ecc"})
+                strip_r = subprocess.run(
+                    ["clevis", "luks", "bind", "-d", real_device, "-k", luks_key,
+                     "tpm2", clevis_no_pcr],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                if strip_r.returncode == 0:
+                    for slot in pcr_still_bound:
+                        subprocess.run(
+                            ["clevis", "luks", "unbind", "-d", real_device, "-s", str(slot), "-f"],
+                            stdin=subprocess.DEVNULL,
+                            check=False,
+                        )
+                    # Refresh slot list — these are now the no-PCR slots to wipe after rebind.
+                    slots = get_clevis_slots(real_device)
+                else:
+                    strip_err = (strip_r.stderr or strip_r.stdout or "").strip()
+                    if strip_err:
+                        _boot_notify(f"Warning: PCR-strip step failed: {strip_err}")
+
             # Bind the new PCR-protected slot FIRST, then remove the old no-PCR slots.
             # If the bind fails, the original slot is preserved and the loop marks failure.
             r = subprocess.run(
