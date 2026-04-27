@@ -106,6 +106,9 @@ fi
 
 %changelog
 
+* Mon Apr 27 2026 Release Bot <release@tuxpatch> - 1.2.7-1
+- Release 1.2.7
+
 * Sat Apr 25 2026 Release Bot <release@tuxpatch> - 1.2.6-1
 - Release 1.2.6
 
