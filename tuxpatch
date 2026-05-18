@@ -561,6 +561,37 @@ def install_firmware_updates() -> bool:
     return r.returncode == 0
 
 
+def firmware_needs_reboot() -> bool:
+    """Return True if fwupdmgr has staged firmware that requires a reboot.
+
+    Uses 'fwupdmgr get-devices --json' to check for devices with the
+    'needs-reboot' flag set.  This is the authoritative way to know whether
+    firmware was actually prepared — it avoids false-positive notifications
+    when fwupdmgr exits 0 but declined to stage the update (e.g. because the
+    laptop is running on battery).
+    """
+    r = subprocess.run(
+        ["fwupdmgr", "get-devices", "--json"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    if r.returncode != 0:
+        return False
+    try:
+        data = json.loads(r.stdout)
+        for device in data.get("Devices", []):
+            flags = device.get("Flags", [])
+            if isinstance(flags, list) and "needs-reboot" in flags:
+                return True
+            # Some fwupd versions report Flags as a comma-separated string
+            if isinstance(flags, str) and "needs-reboot" in flags.split(","):
+                return True
+    except (json.JSONDecodeError, KeyError, TypeError):
+        pass
+    return False
+
+
 # ── RPM / DNF ─────────────────────────────────────────────────────────────────
 
 
@@ -1461,9 +1492,17 @@ def cmd_update(config: dict):
             if fw_updates:
                 print(f"  Found updates for: {', '.join(fw_updates)}")
                 print("Installing firmware updates...")
-                firmware_updated = install_firmware_updates()
-                if not firmware_updated:
+                fw_exit_ok = install_firmware_updates()
+                if not fw_exit_ok:
                     print("Warning: fwupdmgr update reported a non-zero exit code.", file=sys.stderr)
+                # Check whether firmware was actually staged for installation.
+                # fwupdmgr exits 0 even when it skips staging (e.g. battery
+                # power), so the 'needs-reboot' device flag is the only
+                # reliable signal that something was prepared.
+                firmware_updated = firmware_needs_reboot()
+                if fw_exit_ok and not firmware_updated:
+                    print("Note: fwupdmgr succeeded but no device is pending reboot "
+                          "(update may have been skipped, e.g. battery not connected).")
             else:
                 print("No firmware updates available.")
         else:
