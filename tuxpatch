@@ -80,6 +80,7 @@ DEFAULTS = {
     },
     "firmware": {
         "enabled": False,
+        "lvfs_remotes": ["lvfs"],
     },
     "logging": {
         "path": "/var/log/tuxpatch.log",
@@ -503,6 +504,16 @@ def run_flat_manager_checkin():
 
 def _fwupdmgr_available() -> bool:
     return Path("/usr/bin/fwupdmgr").exists()
+
+
+def _fwupd_enable_remotes(remotes: list) -> None:
+    """Ensure the given LVFS remote(s) are enabled (idempotent)."""
+    for remote in remotes:
+        subprocess.run(
+            ["fwupdmgr", "enable-remote", remote],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
 
 def _fwupd_refresh() -> None:
@@ -1441,6 +1452,10 @@ def cmd_update(config: dict):
     if firmware_enabled:
         if _fwupdmgr_available():
             print("\nChecking firmware updates...")
+            lvfs_remotes = firmware_cfg.get(
+                "lvfs_remotes", DEFAULTS["firmware"]["lvfs_remotes"]
+            )
+            _fwupd_enable_remotes(lvfs_remotes)
             _fwupd_refresh()
             fw_updates = get_firmware_updates()
             if fw_updates:

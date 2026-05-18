@@ -59,6 +59,12 @@ firmware:
   # Requires fwupd to be installed (dnf install fwupd).
   # Disabled by default.
   enabled: false
+  # LVFS remotes to enable before checking for updates.
+  # Defaults to [ lvfs ] (stable channel only).
+  # Uncomment lvfs-testing to also receive pre-release firmware.
+  lvfs_remotes:
+    - lvfs
+    #- lvfs-testing
 # ── TPM2 / LUKS Reseal ───────────────────────────────────────────────────────
 # When any RPM package is updated, PCR measurements may change on the next
 # boot (especially shim, GRUB, or kernel updates affect PCR7).  The existing
