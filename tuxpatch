@@ -30,7 +30,7 @@ except ImportError:
 
 VERSION = "1.2.9"
 
-CONFIG_PATH = "/etc/tuxpatch/config.test"
+CONFIG_PATH = "/etc/tuxpatch/config"
 LOCKFILE   = "/var/run/tuxpatch.pid"
 STATE_DIR  = "/var/lib/tuxpatch"
 RESEAL_PENDING_FILE = f"{STATE_DIR}/reseal.pending"
