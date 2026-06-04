@@ -30,7 +30,7 @@ except ImportError:
 
 VERSION = "1.2.9"
 
-CONFIG_PATH = "/etc/tuxpatch/config"
+CONFIG_PATH = "/etc/tuxpatch/config.test"
 LOCKFILE   = "/var/run/tuxpatch.pid"
 STATE_DIR  = "/var/lib/tuxpatch"
 RESEAL_PENDING_FILE = f"{STATE_DIR}/reseal.pending"
@@ -96,6 +96,9 @@ DEFAULTS = {
         "msg_kernel_updated": "A new system kernel has been installed, please reboot.",
         "msg_migrate_updated": "New system configuration has been applied, the system might need a reboot for all changes to apply",
         "msg_firmware_updated": "New firmware for your machine has been prepared, please reboot to complete installation",
+    },
+    "grub_restrict": {
+        "enabled": False,
     },
 }
 
@@ -1376,6 +1379,39 @@ def do_reseal(luks_key: str = None, pcr_ids: str = None, reboot: bool = True,
     else:
         print("Reseal complete.")
 
+# ── GRUB Restrict entries ─────────────────────────────────────────────────────
+
+def restrict_grub(grub_adm_user):
+    """
+    Altering GRUB boot loader entries. Forcing authentication for defined user
+     when booting non-default kernels.
+    """
+
+    r = subprocess.run(
+        ["grubby", "--default-kernel"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+
+    default_kernel_version = r.stdout.removeprefix("/boot/vmlinuz-").strip()
+    entry_dir = Path("/boot/loader/entries")
+
+    print(f"\nRestricting non-default boot entries to user: {grub_adm_user}")
+
+    for entry in entry_dir.glob("*.conf"):
+        lines = entry.read_text().splitlines()
+
+        if str(default_kernel_version) in entry.name:
+            print(f"Removing restriction from default boot entry: {entry}")
+            for i, line in enumerate(lines):
+                if line.startswith("grub_users"):
+                    del lines[i]
+        else:
+            for i, line in enumerate(lines):
+                if line.startswith("grub_users"):
+                    lines[i] = f'grub_users {grub_adm_user}'
+        entry.write_text("\n".join(lines) + "\n")
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
@@ -1551,6 +1587,14 @@ def cmd_update(config: dict):
             print(f"Error: could not write reseal state: {e}", file=sys.stderr)
     else:
         print("\nUpdate complete.")
+
+    # ── 11. Configure GRUB entries ───────────────────────────────────────────
+    grub_restrict_cfg = config.get("grub_restrict", {})
+    grub_restrict_enabled = grub_restrict_cfg.get("enabled", False)
+    grub_restrict_user = grub_restrict_cfg.get("user", "")
+    print(grub_restrict_enabled)
+    if grub_restrict_enabled and grub_restrict_user:
+        restrict_grub(grub_restrict_user)
 
 
 def cmd_status(config: dict):

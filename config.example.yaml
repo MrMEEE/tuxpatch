@@ -31,7 +31,11 @@ connectivity:
   # Seconds before the check is considered failed
   timeout: 5
 
-# ── Users ─────────────────────────────────────────────────────────────────────
+# ── Users ────────────────────grub_restrict:
+  # Default is false even when this key is absent.
+  enabled: False
+  # Default is null and must be defined when enabled is true
+  user: admin─────────────────────────────────────────────────
 # Which users get per-user (--user) flatpak updates.
 users:
   # Local UID range to include (inclusive on both ends)
@@ -101,7 +105,12 @@ tpm_reseal:
   # TPM2 PCR banks to seal the volume against after the update.
   # Default is [7] — Secure Boot state (changes on shim/grub updates).
   #
-  # Common PCR values:
+  # Common PCR values:# ── Notifications ─────────────────────────────────────────────────────────────
+# Desktop notifications are delivered via org.freedesktop.Notifications (D-Bus)
+# directly to each user's session bus at /run/user/<uid>/bus.
+# Notifications are sent only to users who have an active graphical session
+# (i.e. the socket exists).  Works on both KDE and GNOME.
+# All notifications are persistent (urgency=critical, no auto-dismiss).
   #   0  — Core BIOS / UEFI firmware code
   #   1  — BIOS / UEFI configuration data
   #   4  — Boot Manager (shim / GRUB EFI binary hash)
@@ -185,3 +194,12 @@ notifications:  # Set to false to disable all desktop notifications.
   # Message when firmware was updated (sent after fwupdmgr update completes).
   msg_firmware_updated: "New firmware for your machine has been prepared, please reboot to complete installation"
 
+# ── GRUB Restrict entries ─────────────────────────────────────────────────────────────
+# With GRUB_ENABLE_BLSCFG=true in /etc/default/grub, GRUB2 uses blscfg files 
+# and entries in /boot/loader instead of menuentry entries in grub.cfg.
+# It's the standard configuration since RHEL 8.
+grub_restrict:
+  # Default is false even when this key is absent.
+  enabled: false
+  # Default is null and must be defined when enabled is true
+  user: admin
