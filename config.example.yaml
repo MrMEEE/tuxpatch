@@ -185,3 +185,12 @@ notifications:  # Set to false to disable all desktop notifications.
   # Message when firmware was updated (sent after fwupdmgr update completes).
   msg_firmware_updated: "New firmware for your machine has been prepared, please reboot to complete installation"
 
+# ── GRUB Restrict entries ─────────────────────────────────────────────────────────────
+# With GRUB_ENABLE_BLSCFG=true in /etc/default/grub, GRUB2 uses blscfg files
+# and entries in /boot/loader instead of menuentry entries in grub.cfg.
+# It's the standard configuration since RHEL 8.
+grub_restrict:
+  # Default is false even when this key is absent.
+  enabled: false
+  # Default is null and must be defined when enabled is true
+  user: admin
