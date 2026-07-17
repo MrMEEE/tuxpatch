@@ -14,7 +14,7 @@ Release:        1%{?dist}
 Summary:        RHEL workstation patch manager with TPM2/LUKS reseal support
 License:        GPL-3.0-or-later
 URL:            https://github.com/MrMEEE/tuxpatch
-Source0:        %{name}-%{version}.tar.gz
+Source0:        https://github.com/MrMEEE/tuxpatch/archive/refs/tags/v%{version}.tar.gz#/%{name}-%{version}.tar.gz
 BuildArch:      noarch
 
 BuildRequires:  python3
