@@ -9,7 +9,7 @@
 #  tuxpatch
 # ─────────────────────────────────────────────────────────────────────────────
 Name:           tuxpatch
-Version:        %{version_string}
+Version:        1.2.11
 Release:        1%{?dist}
 Summary:        RHEL workstation patch manager with TPM2/LUKS reseal support
 License:        GPL-3.0-or-later

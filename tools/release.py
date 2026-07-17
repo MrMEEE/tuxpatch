@@ -3,17 +3,18 @@
 tuxpatch Release Manager
 
 Automates the full release process:
-  - Version bump (patch by default, or --minor / --major / --version X.Y.Z)
-  - Updates VERSION in the tuxpatch script
-  - Prepends a %changelog entry to packaging/tuxpatch.spec
-  - git commit → tag → push
+    - Version bump (patch by default, or --minor / --major / --version X.Y.Z)
+    - Updates VERSION in the tuxpatch script
+    - Stamps a concrete Version: X.Y.Z in packaging/tuxpatch.spec
+    - Prepends a %changelog entry to packaging/tuxpatch.spec
+    - git commit -> tag -> push
 
 Usage:
-    python tools/release.py                    # patch bump  (1.0.0 → 1.0.1)
-    python tools/release.py --minor            # minor bump  (1.0.1 → 1.1.0)
-    python tools/release.py --major            # major bump  (1.1.0 → 2.0.0)
+    python tools/release.py                    # patch bump  (1.0.0 -> 1.0.1)
+    python tools/release.py --minor            # minor bump  (1.0.1 -> 1.1.0)
+    python tools/release.py --major            # major bump  (1.1.0 -> 2.0.0)
     python tools/release.py --version 2.0.0    # explicit version
-    python tools/release.py --dry-run          # preview — no changes written
+    python tools/release.py --dry-run          # preview - no changes written
 """
 
 from __future__ import annotations
@@ -169,6 +170,23 @@ class ReleaseManager:
             SCRIPT_FILE.write_text(new_text)
         self._changes.append(str(SCRIPT_FILE.relative_to(PROJECT_ROOT)))
 
+    def update_version_in_spec(self, new_version: str) -> None:
+        self.info(f"Updating Version in {SPEC_FILE.relative_to(PROJECT_ROOT)}")
+        text = SPEC_FILE.read_text()
+        new_text = re.sub(
+            r"^(Version\s*:\s*).*$",
+            rf"\g<1>{new_version}",
+            text,
+            flags=re.MULTILINE,
+        )
+        if new_text == text:
+            raise ReleaseError(f"Version line not updated - pattern did not match in {SPEC_FILE}")
+        if not self.dry_run:
+            SPEC_FILE.write_text(new_text)
+        rel_spec = str(SPEC_FILE.relative_to(PROJECT_ROOT))
+        if rel_spec not in self._changes:
+            self._changes.append(rel_spec)
+
     def update_spec_changelog(self, new_version: str) -> None:
         self.info(f"Prepending %changelog entry to {SPEC_FILE.relative_to(PROJECT_ROOT)}")
         today = datetime.now().strftime("%a %b %d %Y")
@@ -222,6 +240,7 @@ class ReleaseManager:
 
         # 3. Update files
         self.update_version_in_script(new_version)
+        self.update_version_in_spec(new_version)
         self.update_spec_changelog(new_version)
 
         # 4. Git

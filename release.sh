@@ -2,8 +2,9 @@
 #
 # tuxpatch release wrapper
 #
-# Bumps the version, updates the VERSION line in the tuxpatch script and
-# the RPM spec changelog, then commits, tags, and pushes — which triggers
+# Bumps the version, updates the VERSION line in the tuxpatch script,
+# stamps a concrete RPM spec Version value, updates the RPM spec changelog,
+# then commits, tags, and pushes — which triggers
 # the GitHub Actions RPM build workflow.
 #
 # Usage:
