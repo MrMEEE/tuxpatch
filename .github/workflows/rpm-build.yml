@@ -78,9 +78,7 @@ jobs:
       # ── Build RPM ───────────────────────────────────────────────────────────
       - name: Build RPM
         run: |
-          VERSION="${{ steps.ver.outputs.version }}"
           rpmbuild -ba packaging/tuxpatch.spec \
-            --define "version_string ${VERSION}" \
             --define "_topdir ${HOME}/rpmbuild"
 
       # ── List output ─────────────────────────────────────────────────────────

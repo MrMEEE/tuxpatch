@@ -28,7 +28,7 @@ try:
 except ImportError:
     sys.exit("Error: PyYAML is required. Install with: dnf install python3-pyyaml")
 
-VERSION = "1.2.10"
+VERSION = "1.2.13"
 
 CONFIG_PATH = "/etc/tuxpatch/config"
 LOCKFILE   = "/var/run/tuxpatch.pid"
@@ -1459,6 +1459,9 @@ def cmd_update(config: dict):
     else:
         needs_reseal = False
 
+    # Tracks whether we've already switched TPM bindings to no-PCR mode.
+    pcr_relaxed = False
+
     kernel_will_update = any(
         _pkg_base_lower(p).startswith("kernel") for p in rpm_updates
     )
@@ -1478,6 +1481,8 @@ def cmd_update(config: dict):
                 file=sys.stderr,
             )
             needs_reseal = False
+        else:
+            pcr_relaxed = True
 
     # ── 4. Update per-user flatpaks ───────────────────────────────────────────
     users = {}
@@ -1534,18 +1539,35 @@ def cmd_update(config: dict):
             fw_updates = get_firmware_updates()
             if fw_updates:
                 print(f"  Found updates for: {', '.join(fw_updates)}")
-                print("Installing firmware updates...")
-                fw_exit_ok = install_firmware_updates()
-                if not fw_exit_ok:
-                    print("Warning: fwupdmgr update reported a non-zero exit code.", file=sys.stderr)
-                # Check whether firmware was actually staged for installation.
-                # fwupdmgr exits 0 even when it skips staging (e.g. battery
-                # power), so the 'needs-reboot' device flag is the only
-                # reliable signal that something was prepared.
-                firmware_updated = firmware_needs_reboot()
-                if fw_exit_ok and not firmware_updated:
-                    print("Note: fwupdmgr succeeded but no device is pending reboot "
-                          "(update may have been skipped, e.g. battery not connected).")
+                if reseal_enabled and not pcr_relaxed:
+                    print("TPM reseal enabled — removing PCR binding before firmware update:")
+                    if not unseal_for_update(config):
+                        print(
+                            "Warning: failed to remove PCR binding. "
+                            "Skipping firmware updates to avoid a potential TPM unlock failure after reboot.",
+                            file=sys.stderr,
+                        )
+                        fw_updates = []
+                    else:
+                        pcr_relaxed = True
+                        needs_reseal = True
+
+                if not fw_updates:
+                    print("Firmware updates found but skipped because PCR binding could not be safely relaxed.")
+                    firmware_updated = False
+                else:
+                    print("Installing firmware updates...")
+                    fw_exit_ok = install_firmware_updates()
+                    if not fw_exit_ok:
+                        print("Warning: fwupdmgr update reported a non-zero exit code.", file=sys.stderr)
+                    # Check whether firmware was actually staged for installation.
+                    # fwupdmgr exits 0 even when it skips staging (e.g. battery
+                    # power), so the 'needs-reboot' device flag is the only
+                    # reliable signal that something was prepared.
+                    firmware_updated = firmware_needs_reboot()
+                    if fw_exit_ok and not firmware_updated:
+                        print("Note: fwupdmgr succeeded but no device is pending reboot "
+                              "(update may have been skipped, e.g. battery not connected).")
             else:
                 print("No firmware updates available.")
         else:

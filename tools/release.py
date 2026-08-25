@@ -3,17 +3,18 @@
 tuxpatch Release Manager
 
 Automates the full release process:
-  - Version bump (patch by default, or --minor / --major / --version X.Y.Z)
-  - Updates VERSION in the tuxpatch script
-  - Prepends a %changelog entry to packaging/tuxpatch.spec
-  - git commit → tag → push
+    - Version bump (patch by default, or --minor / --major / --version X.Y.Z)
+    - Updates VERSION in the tuxpatch script
+    - Stamps a concrete Version: X.Y.Z in packaging/tuxpatch.spec
+    - Prepends a %changelog entry to packaging/tuxpatch.spec
+    - git commit -> tag -> push
 
 Usage:
-    python tools/release.py                    # patch bump  (1.0.0 → 1.0.1)
-    python tools/release.py --minor            # minor bump  (1.0.1 → 1.1.0)
-    python tools/release.py --major            # major bump  (1.1.0 → 2.0.0)
+    python tools/release.py                    # patch bump  (1.0.0 -> 1.0.1)
+    python tools/release.py --minor            # minor bump  (1.0.1 -> 1.1.0)
+    python tools/release.py --major            # major bump  (1.1.0 -> 2.0.0)
     python tools/release.py --version 2.0.0    # explicit version
-    python tools/release.py --dry-run          # preview — no changes written
+    python tools/release.py --dry-run          # preview - no changes written
 """
 
 from __future__ import annotations
@@ -89,8 +90,12 @@ class ReleaseManager:
     # ── Version parsing ───────────────────────────────────────────────────────
 
     @staticmethod
+    def normalize_version(s: str) -> str:
+        return s.strip().lstrip("vV")
+
+    @staticmethod
     def parse_version(s: str) -> tuple[int, int, int]:
-        m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", s.strip())
+        m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", ReleaseManager.normalize_version(s))
         if not m:
             raise ReleaseError(f"Invalid version format: {s!r}  (expected X.Y.Z)")
         return int(m.group(1)), int(m.group(2)), int(m.group(3))
@@ -104,7 +109,7 @@ class ReleaseManager:
         m = re.search(r'^VERSION\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
         if not m:
             raise ReleaseError(f"Could not find VERSION in {SCRIPT_FILE}")
-        return m.group(1)
+        return self.normalize_version(m.group(1))
 
     def bump(self, current: str, mode: str) -> str:
         maj, min_, pat = self.parse_version(current)
@@ -145,7 +150,7 @@ class ReleaseManager:
             self.warn(f"{ahead} commit(s) ahead of origin/{branch} — they will be pushed with the tag.")
 
     def check_tag_doesnt_exist(self, version: str) -> None:
-        tag = f"v{version}"
+        tag = f"v{self.normalize_version(version)}"
         existing = self._run(
             ["git", "tag", "-l", tag], read_only=True
         ).stdout.strip()
@@ -169,6 +174,23 @@ class ReleaseManager:
             SCRIPT_FILE.write_text(new_text)
         self._changes.append(str(SCRIPT_FILE.relative_to(PROJECT_ROOT)))
 
+    def update_version_in_spec(self, new_version: str) -> None:
+        self.info(f"Updating Version in {SPEC_FILE.relative_to(PROJECT_ROOT)}")
+        text = SPEC_FILE.read_text()
+        new_text = re.sub(
+            r"^(Version\s*:\s*).*$",
+            rf"\g<1>{new_version}",
+            text,
+            flags=re.MULTILINE,
+        )
+        if new_text == text:
+            raise ReleaseError(f"Version line not updated - pattern did not match in {SPEC_FILE}")
+        if not self.dry_run:
+            SPEC_FILE.write_text(new_text)
+        rel_spec = str(SPEC_FILE.relative_to(PROJECT_ROOT))
+        if rel_spec not in self._changes:
+            self._changes.append(rel_spec)
+
     def update_spec_changelog(self, new_version: str) -> None:
         self.info(f"Prepending %changelog entry to {SPEC_FILE.relative_to(PROJECT_ROOT)}")
         today = datetime.now().strftime("%a %b %d %Y")
@@ -191,7 +213,7 @@ class ReleaseManager:
     # ── Git operations ────────────────────────────────────────────────────────
 
     def git_commit_tag_push(self, new_version: str) -> None:
-        tag = f"v{new_version}"
+        tag = f"v{self.normalize_version(new_version)}"
         self._run(["git", "add"] + self._changes)
         self._run(["git", "commit", "-m", f"chore: release {new_version}"])
         self._run(["git", "tag", "-a", tag, "-m", f"Release {new_version}"])
@@ -208,8 +230,9 @@ class ReleaseManager:
         # 1. Determine new version
         current = self.current_version()
         if explicit_version:
-            self.parse_version(explicit_version)   # validates format
-            new_version = explicit_version
+            normalized = self.normalize_version(explicit_version)
+            self.parse_version(normalized)   # validates format
+            new_version = normalized
         else:
             new_version = self.bump(current, mode)
 
@@ -222,6 +245,7 @@ class ReleaseManager:
 
         # 3. Update files
         self.update_version_in_script(new_version)
+        self.update_version_in_spec(new_version)
         self.update_spec_changelog(new_version)
 
         # 4. Git
