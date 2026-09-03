@@ -1408,9 +1408,16 @@ def restrict_grub(grub_adm_user):
                 if line.startswith("grub_users"):
                     del lines[i]
         else:
+            grub_users_found = False
+
             for i, line in enumerate(lines):
                 if line.startswith("grub_users"):
                     lines[i] = f'grub_users {grub_adm_user}'
+                    grub_users_found = True
+
+            if not grub_users_found:
+                lines.append(f"grub_users {grub_adm_user}")
+
         entry.write_text("\n".join(lines) + "\n")
 
 # ── Commands ──────────────────────────────────────────────────────────────────
